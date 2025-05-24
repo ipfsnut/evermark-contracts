@@ -8,6 +8,7 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /*
  ███╗   ██╗███████╗████████╗    ███████╗████████╗ █████╗ ██╗  ██╗██╗███╗   ██╗ ██████╗ 
@@ -19,12 +20,13 @@ import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 */
 
 interface IEvermarkVoting {
-    function getBookmarkVotesInCycle(uint256 cycle, uint256 bookmarkId) external view returns (uint256);
+    function getEvermarkVotesInCycle(uint256 cycle, uint256 evermarkId) external view returns (uint256);
     function getCurrentCycle() external view returns (uint256);
 }
 
-interface IEvermarkRewards {
-    function distributeNftStakingRewards(address[] calldata users, uint256[] calldata amounts) external;
+interface IEvermarkNFT {
+    function getEvermarkCreator(uint256 tokenId) external view returns (address);
+    function exists(uint256 tokenId) external view returns (bool);
 }
 
 contract NFTStaking is 
@@ -44,9 +46,6 @@ contract NFTStaking is
     uint256 public constant LOCK_PERIOD_14_DAYS = 14 days; 
     uint256 public constant LOCK_PERIOD_30_DAYS = 30 days;
 
-    // Base reward rate (tokens per vote per week)
-    uint256 public constant BASE_REWARD_PER_VOTE = 1e15; // 0.001 tokens per vote
-
     struct StakedNFT {
         address owner;
         uint256 stakedAt;
@@ -56,25 +55,19 @@ contract NFTStaking is
         bool active;
     }
 
-    struct RewardCycle {
-        uint256 cycle;
-        uint256 totalVotes;
-        uint256 rewardMultiplier;
-        bool processed;
-    }
-
     // Storage
     IERC721 public evermarkNFT;
     IEvermarkVoting public evermarkVoting;
-    IEvermarkRewards public evermarkRewards;
+    IEvermarkNFT public evermarkNFTInterface;
+    IERC20 public rewardToken; // EMARK token
     
     // NFT staking data
     mapping(uint256 => StakedNFT) public stakedNFTs;
     mapping(address => uint256[]) public userStakedNFTs;
     
-    // Reward tracking
+    // Reward tracking per week/cycle
     mapping(uint256 => mapping(uint256 => uint256)) public nftVotesPerCycle; // cycle => tokenId => votes
-    mapping(uint256 => RewardCycle) public rewardCycles;
+    mapping(address => uint256) public pendingRewards;
     
     // Global stats
     uint256 public totalStakedNFTs;
@@ -84,9 +77,9 @@ contract NFTStaking is
     // Events
     event NFTStaked(address indexed owner, uint256 indexed tokenId, uint256 lockPeriod);
     event NFTUnstaked(address indexed owner, uint256 indexed tokenId, uint256 rewards);
-    event RewardsCalculated(uint256 indexed cycle, uint256 totalNFTs, uint256 totalRewards);
     event RewardsClaimed(address indexed user, uint256[] tokenIds, uint256 totalRewards);
     event VotesRecorded(uint256 indexed cycle, uint256 indexed tokenId, uint256 votes);
+    event RewardsDistributed(address[] users, uint256[] amounts, uint256 totalDistributed);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -96,7 +89,8 @@ contract NFTStaking is
     function initialize(
         address _evermarkNFT,
         address _evermarkVoting,
-        address _evermarkRewards
+        address _evermarkNFTInterface,
+        address _rewardToken
     ) external initializer {
         __AccessControl_init();
         __Pausable_init();
@@ -110,7 +104,8 @@ contract NFTStaking is
 
         evermarkNFT = IERC721(_evermarkNFT);
         evermarkVoting = IEvermarkVoting(_evermarkVoting);
-        evermarkRewards = IEvermarkRewards(_evermarkRewards);
+        evermarkNFTInterface = IEvermarkNFT(_evermarkNFTInterface);
+        rewardToken = IERC20(_rewardToken);
         
         currentCycle = 1;
     }
@@ -125,6 +120,7 @@ contract NFTStaking is
         );
         require(evermarkNFT.ownerOf(tokenId) == msg.sender, "Not the owner");
         require(!stakedNFTs[tokenId].active, "NFT already staked");
+        require(evermarkNFTInterface.exists(tokenId), "NFT does not exist");
 
         // Transfer NFT to contract
         evermarkNFT.transferFrom(msg.sender, address(this), tokenId);
@@ -184,9 +180,9 @@ contract NFTStaking is
         uint256 timeStaked = block.timestamp - stakedNFT.stakedAt;
         require(timeStaked >= stakedNFT.lockPeriod, "Lock period not complete");
 
-        // Calculate and claim any pending rewards
-        uint256 pendingRewards = calculatePendingRewards(tokenId);
-        uint256 totalRewards = stakedNFT.accumulatedRewards + pendingRewards;
+        // Calculate and add any pending rewards
+        uint256 pendingRewardsAmount = calculatePendingRewards(tokenId);
+        uint256 totalRewards = stakedNFT.accumulatedRewards + pendingRewardsAmount;
 
         // Mark as inactive
         stakedNFT.active = false;
@@ -195,13 +191,18 @@ contract NFTStaking is
         _removeFromUserStakedList(msg.sender, tokenId);
         totalStakedNFTs--;
 
+        // Add rewards to user's pending balance
+        if (totalRewards > 0) {
+            pendingRewards[msg.sender] += totalRewards;
+        }
+
         // Transfer NFT back to owner
         evermarkNFT.transferFrom(address(this), msg.sender, tokenId);
 
         emit NFTUnstaked(msg.sender, tokenId, totalRewards);
     }
 
-    // Calculate rewards based on votes received in previous cycles
+    // Calculate pending rewards based on votes received
     function calculatePendingRewards(uint256 tokenId) public view returns (uint256) {
         StakedNFT memory stakedNFT = stakedNFTs[tokenId];
         if (!stakedNFT.active) return 0;
@@ -214,31 +215,14 @@ contract NFTStaking is
         for (uint256 cycle = cycleToProcess; cycle <= latestCycle; cycle++) {
             uint256 votes = nftVotesPerCycle[cycle][tokenId];
             if (votes > 0) {
-                uint256 baseReward = votes * BASE_REWARD_PER_VOTE;
+                // Base reward calculation (simplified)
+                uint256 baseReward = votes * 1e15; // 0.001 EMARK per vote
                 uint256 multiplier = _getMultiplier(stakedNFT.lockPeriod);
                 rewards += (baseReward * multiplier) / 100;
             }
         }
 
         return rewards;
-    }
-
-    // Calculate projected rewards for next cycle
-    function calculateProjectedRewards(uint256 tokenId) external view returns (uint256) {
-        StakedNFT memory stakedNFT = stakedNFTs[tokenId];
-        if (!stakedNFT.active) return 0;
-
-        // Get votes from previous cycle to project
-        uint256 previousCycle = currentCycle > 1 ? currentCycle - 1 : 1;
-        uint256 lastCycleVotes = nftVotesPerCycle[previousCycle][tokenId];
-        
-        if (lastCycleVotes > 0) {
-            uint256 baseReward = lastCycleVotes * BASE_REWARD_PER_VOTE;
-            uint256 multiplier = _getMultiplier(stakedNFT.lockPeriod);
-            return (baseReward * multiplier) / 100;
-        }
-        
-        return 0;
     }
 
     // Get lock period multiplier
@@ -249,7 +233,19 @@ contract NFTStaking is
         return 100; // 1x (fallback)
     }
 
-    // Record votes for NFTs (called by voting contract or admin)
+    // Sync votes from voting contract for a specific cycle
+    function syncVotesFromVotingContract(uint256 cycle, uint256[] calldata tokenIds) external {
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            uint256 tokenId = tokenIds[i];
+            if (stakedNFTs[tokenId].active) {
+                uint256 votes = evermarkVoting.getEvermarkVotesInCycle(cycle, tokenId);
+                nftVotesPerCycle[cycle][tokenId] = votes;
+                emit VotesRecorded(cycle, tokenId, votes);
+            }
+        }
+    }
+
+    // Manual vote recording (for admin/rewards manager)
     function recordVotesForCycle(
         uint256 cycle,
         uint256[] calldata tokenIds,
@@ -265,46 +261,56 @@ contract NFTStaking is
         }
     }
 
-    // Batch update votes from voting contract
-    function syncVotesFromVotingContract(uint256 cycle, uint256[] calldata tokenIds) external {
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            uint256 tokenId = tokenIds[i];
-            if (stakedNFTs[tokenId].active) {
-                uint256 votes = evermarkVoting.getBookmarkVotesInCycle(cycle, tokenId);
-                nftVotesPerCycle[cycle][tokenId] = votes;
-                emit VotesRecorded(cycle, tokenId, votes);
-            }
-        }
-    }
-
-    // Claim accumulated rewards for multiple NFTs
-    function claimRewards(uint256[] calldata tokenIds) external whenNotPaused nonReentrant {
-        require(tokenIds.length > 0, "No tokens specified");
+    // Claim all pending rewards
+    function claimRewards() external whenNotPaused nonReentrant returns (uint256) {
+        address user = msg.sender;
+        uint256 totalRewards = pendingRewards[user];
         
-        uint256 totalRewards = 0;
-        
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            uint256 tokenId = tokenIds[i];
-            StakedNFT storage stakedNFT = stakedNFTs[tokenId];
-            
-            require(stakedNFT.active, "NFT not staked");
-            require(stakedNFT.owner == msg.sender, "Not the owner");
-            
-            uint256 pendingRewards = calculatePendingRewards(tokenId);
-            if (pendingRewards > 0) {
-                stakedNFT.accumulatedRewards += pendingRewards;
-                stakedNFT.lastRewardCycle = currentCycle;
-                totalRewards += pendingRewards;
+        // Add any unclaimed staking rewards
+        uint256[] memory userTokens = userStakedNFTs[user];
+        for (uint256 i = 0; i < userTokens.length; i++) {
+            uint256 tokenId = userTokens[i];
+            if (stakedNFTs[tokenId].active && stakedNFTs[tokenId].owner == user) {
+                uint256 pending = calculatePendingRewards(tokenId);
+                if (pending > 0) {
+                    stakedNFTs[tokenId].accumulatedRewards += pending;
+                    stakedNFTs[tokenId].lastRewardCycle = currentCycle;
+                    totalRewards += pending;
+                }
             }
         }
         
         require(totalRewards > 0, "No rewards to claim");
         
-        // Note: In production, this would mint or transfer reward tokens
-        // For now, we just emit the event and update internal accounting
+        // Reset pending rewards
+        pendingRewards[user] = 0;
+        
+        // Update tracking
         totalRewardsDistributed += totalRewards;
         
-        emit RewardsClaimed(msg.sender, tokenIds, totalRewards);
+        // Transfer EMARK tokens
+        require(rewardToken.transfer(user, totalRewards), "Reward transfer failed");
+        
+        emit RewardsClaimed(user, userTokens, totalRewards);
+        return totalRewards;
+    }
+
+    // Distribute rewards to users (called by EvermarkRewards contract)
+    function distributeRewards(
+        address[] calldata users,
+        uint256[] calldata amounts
+    ) external onlyRole(REWARDS_MANAGER_ROLE) {
+        require(users.length == amounts.length, "Array length mismatch");
+        
+        uint256 totalDistributed = 0;
+        for (uint256 i = 0; i < users.length; i++) {
+            if (amounts[i] > 0) {
+                pendingRewards[users[i]] += amounts[i];
+                totalDistributed += amounts[i];
+            }
+        }
+        
+        emit RewardsDistributed(users, amounts, totalDistributed);
     }
 
     // Get user's staked NFTs and their status
@@ -312,7 +318,7 @@ contract NFTStaking is
         uint256[] memory tokenIds,
         uint256[] memory stakedTimes,
         uint256[] memory lockPeriods,
-        uint256[] memory pendingRewards,
+        uint256[] memory pendingRewardsAmounts,
         bool[] memory canUnstake
     ) {
         uint256[] memory userTokens = userStakedNFTs[user];
@@ -329,7 +335,7 @@ contract NFTStaking is
         tokenIds = new uint256[](activeCount);
         stakedTimes = new uint256[](activeCount);
         lockPeriods = new uint256[](activeCount);
-        pendingRewards = new uint256[](activeCount);
+        pendingRewardsAmounts = new uint256[](activeCount);
         canUnstake = new bool[](activeCount);
         
         uint256 index = 0;
@@ -341,24 +347,26 @@ contract NFTStaking is
                 tokenIds[index] = tokenId;
                 stakedTimes[index] = stakedNFT.stakedAt;
                 lockPeriods[index] = stakedNFT.lockPeriod;
-                pendingRewards[index] = calculatePendingRewards(tokenId);
+                pendingRewardsAmounts[index] = calculatePendingRewards(tokenId);
                 canUnstake[index] = (block.timestamp - stakedNFT.stakedAt) >= stakedNFT.lockPeriod;
                 index++;
             }
         }
     }
 
-    // Get staking statistics
-    function getStakingStats() external view returns (
-        uint256 totalStaked,
-        uint256 totalRewards,
-        uint256 currentCycleNumber,
-        uint256 averageRewardPerNFT
-    ) {
-        totalStaked = totalStakedNFTs;
-        totalRewards = totalRewardsDistributed;
-        currentCycleNumber = currentCycle;
-        averageRewardPerNFT = totalStakedNFTs > 0 ? totalRewardsDistributed / totalStakedNFTs : 0;
+    // Get user's total pending rewards (including from pending balance)
+    function getUserTotalPendingRewards(address user) external view returns (uint256) {
+        uint256 total = pendingRewards[user];
+        
+        uint256[] memory userTokens = userStakedNFTs[user];
+        for (uint256 i = 0; i < userTokens.length; i++) {
+            uint256 tokenId = userTokens[i];
+            if (stakedNFTs[tokenId].active && stakedNFTs[tokenId].owner == user) {
+                total += calculatePendingRewards(tokenId);
+            }
+        }
+        
+        return total;
     }
 
     // Remove NFT from user's staked list
@@ -379,22 +387,20 @@ contract NFTStaking is
         currentCycle = newCycle;
     }
 
-    function setEvermarkVoting(address _evermarkVoting) external onlyRole(ADMIN_ROLE) {
-        require(_evermarkVoting != address(0), "Invalid address");
+    function setRewardToken(address _rewardToken) external onlyRole(ADMIN_ROLE) {
+        require(_rewardToken != address(0), "Invalid token address");
+        rewardToken = IERC20(_rewardToken);
+    }
+
+    function setContracts(
+        address _evermarkVoting,
+        address _evermarkNFTInterface
+    ) external onlyRole(ADMIN_ROLE) {
+        require(_evermarkVoting != address(0), "Invalid voting address");
+        require(_evermarkNFTInterface != address(0), "Invalid NFT interface address");
+        
         evermarkVoting = IEvermarkVoting(_evermarkVoting);
-    }
-
-    function setEvermarkRewards(address _evermarkRewards) external onlyRole(ADMIN_ROLE) {
-        require(_evermarkRewards != address(0), "Invalid address");
-        evermarkRewards = IEvermarkRewards(_evermarkRewards);
-    }
-
-    function grantRewardsManagerRole(address manager) external onlyRole(ADMIN_ROLE) {
-        grantRole(REWARDS_MANAGER_ROLE, manager);
-    }
-
-    function revokeRewardsManagerRole(address manager) external onlyRole(ADMIN_ROLE) {
-        revokeRole(REWARDS_MANAGER_ROLE, manager);
+        evermarkNFTInterface = IEvermarkNFT(_evermarkNFTInterface);
     }
 
     function pause() external onlyRole(ADMIN_ROLE) {
@@ -405,7 +411,14 @@ contract NFTStaking is
         _unpause();
     }
 
-    // Emergency NFT recovery
+    // Emergency functions
+    function emergencyWithdrawTokens(uint256 amount, address recipient) external onlyRole(ADMIN_ROLE) {
+        require(recipient != address(0), "Invalid recipient");
+        require(amount <= rewardToken.balanceOf(address(this)), "Insufficient balance");
+        
+        rewardToken.transfer(recipient, amount);
+    }
+
     function emergencyUnstakeNFT(uint256 tokenId, address owner) external onlyRole(ADMIN_ROLE) {
         require(stakedNFTs[tokenId].active, "NFT not staked");
         

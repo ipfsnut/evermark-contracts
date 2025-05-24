@@ -1,631 +1,253 @@
-# 🌟 Evermark Contract Suite - Complete Rewrite Plan
+# 🚀 Complete Evermark System - Integration Guide
 
-## Contract Architecture Overview
+## 📋 **Full Feature Set Delivered**
+
+### **Core Features**
+✅ **Evermark NFT Minting** with referral system  
+✅ **EMARK Token Staking** with voting power  
+✅ **NFT Staking** with lock periods and vote-based rewards  
+✅ **Weekly Reward Distribution** (60% stakers, 40% creators)  
+✅ **Delegation-based Variable Rewards** (50% base + 50% variable)  
+✅ **Creator Leaderboard** with automated rewards  
+✅ **NFT Auctions** with fee distribution  
+✅ **Comprehensive Fee Collection** and routing  
+
+## 🏗 **System Architecture**
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   EvermarkNFT   │───▶│  FeeCollector    │───▶│ EvermarkRewards │
-│   (Enhanced)    │    │                  │    │   (Enhanced)    │
+│  (w/ Referrals) │    │  (Fee Router)    │    │ (Coordinator)   │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │                       │
          ▼                       ▼                       ▼
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│ EvermarkVoting  │    │   Treasury       │    │   CardCatalog   │
-│                 │    │   (Multisig)     │    │   (Staking)     │
+│ EvermarkVoting  │    │   CardCatalog    │    │ EvermarkLeader- │
+│ (Vote Tracking) │    │ (EMARK Staking)  │    │ board (Creator  │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                                               │
-         ▼                                               ▼
-┌─────────────────┐                            ┌─────────────────┐
-│EvermarkLeader-  │                            │ NFTStaking      │
-│board            │                            │ (New)           │
-└─────────────────┘                            └─────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│ EvermarkAuction │
-│                 │
-└─────────────────┘
+         │                       │                       │
+         ▼                       ▼                       ▼
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   NFTStaking    │    │ EvermarkAuction  │    │   Frontend UI   │
+│ (NFT Rewards)   │    │ (Marketplace)    │    │               │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
 ```
 
-## 1. EvermarkNFT (Enhanced) 
+## 💰 **Reward Flow (Weekly Cycle)**
 
-### New Features
+### **Week N: Collection Phase**
+1. **Trading fees** → FeeCollector
+2. **NFT creation fees** → FeeCollector  
+3. **Auction fees** → FeeCollector
+4. **Manual funding** → EvermarkRewards
+
+### **Week N+1: Distribution Phase**
+```
+Total Weekly Pool (100%)
+├── 60% → EMARK Token Stakers
+│   ├── 30% → Base Rewards (equal distribution)
+│   └── 30% → Variable Rewards (delegation-based)
+└── 40% → Creator Rewards (leaderboard-based)
+```
+
+### **Example: Alice stakes 100 EMARK, delegates 75**
+- **Base Rewards**: Full share of 30% pool based on her 100 EMARK stake
+- **Variable Rewards**: 75% of her potential share from 30% pool (because she delegated 75%)
+- **Total**: Base + (0.75 × Variable)
+
+## 🔄 **Weekly Operations Workflow**
+
+### **Monday: New Week Starts**
 ```solidity
-/*
- ███████╗██╗   ██╗███████╗██████╗ ███╗   ███╗ █████╗ ██████╗ ██╗  ██╗
- ██╔════╝██║   ██║██╔════╝██╔══██╗████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝
- █████╗  ██║   ██║█████╗  ██████╔╝██╔████╔██║███████║██████╔╝█████╔╝ 
- ██╔══╝  ╚██╗ ██╔╝██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗ 
- ███████╗ ╚████╔╝ ███████╗██║  ██║██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██╗
- ╚══════╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝
- 
- Content Preservation NFTs with Viral Growth
-*/
+// 1. Fund the week's rewards
+evermarkRewards.fundWeeklyRewards(1000000 * 1e18); // 1M EMARK
 
-contract EvermarkNFT is ERC721Upgradeable, AccessControlUpgradeable {
-    uint256 public constant MINTING_FEE = 0.0007 ether;
-    uint256 public constant REFERRAL_PERCENTAGE = 10; // 10% of fee goes to referrer
-    address public feeCollector;
-    
-    // Referral tracking
-    mapping(address => uint256) public referralCounts;
-    mapping(address => uint256) public referralEarnings;
-    mapping(uint256 => address) public evermarkReferrers; // tokenId => referrer
-    
-    event EvermarkMinted(uint256 indexed tokenId, address indexed minter, address indexed referrer, string title);
-    event ReferralEarned(address indexed referrer, address indexed referred, uint256 amount);
-    
-    // Standard minting (no referrer)
-    function mintEvermark(
-        string calldata metadataURI,
-        string calldata title, 
-        string calldata creator
-    ) external payable returns (uint256) {
-        return mintEvermarkWithReferral(metadataURI, title, creator, address(0));
-    }
-    
-    // Enhanced minting with referral system
-    function mintEvermarkWithReferral(
-        string calldata metadataURI,
-        string calldata title, 
-        string calldata creator,
-        address referrer
-    ) external payable returns (uint256) {
-        require(msg.value >= MINTING_FEE, "Insufficient minting fee");
-        require(referrer != msg.sender, "Cannot refer yourself");
-        
-        uint256 tokenId = _mintEvermark(msg.sender, metadataURI, title, creator);
-        
-        // Handle referral fee split
-        uint256 referralFee = 0;
-        if (referrer != address(0)) {
-            referralFee = (msg.value * REFERRAL_PERCENTAGE) / 100;
-            
-            // Pay referrer immediately
-            payable(referrer).transfer(referralFee);
-            
-            // Track referral stats
-            referralCounts[referrer]++;
-            referralEarnings[referrer] += referralFee;
-            evermarkReferrers[tokenId] = referrer;
-            
-            emit ReferralEarned(referrer, msg.sender, referralFee);
-        }
-        
-        // Send remaining fee to collector
-        uint256 remainingFee = msg.value - referralFee;
-        if (remainingFee > 0) {
-            (bool success,) = feeCollector.call{value: remainingFee}(
-                abi.encodeWithSignature("collectNftCreationFees()")
-            );
-            require(success, "Fee collection failed");
-        }
-        
-        emit EvermarkMinted(tokenId, msg.sender, referrer, title);
-        return tokenId;
-    }
-    
-    // Batch minting with referrals
-    function mintEvermarkBatch(
-        string[] calldata metadataURIs,
-        string[] calldata titles,
-        string[] calldata creators,
-        address referrer
-    ) external payable returns (uint256[] memory) {
-        uint256 count = metadataURIs.length;
-        require(msg.value >= MINTING_FEE * count, "Insufficient batch fee");
-        require(referrer != msg.sender, "Cannot refer yourself");
-        
-        uint256[] memory tokenIds = new uint256[](count);
-        
-        for (uint256 i = 0; i < count; i++) {
-            tokenIds[i] = _mintEvermark(msg.sender, metadataURIs[i], titles[i], creators[i]);
-            
-            if (referrer != address(0)) {
-                evermarkReferrers[tokenIds[i]] = referrer;
-            }
-        }
-        
-        // Handle batch referral payment
-        if (referrer != address(0)) {
-            uint256 totalReferralFee = (msg.value * REFERRAL_PERCENTAGE) / 100;
-            payable(referrer).transfer(totalReferralFee);
-            
-            referralCounts[referrer] += count;
-            referralEarnings[referrer] += totalReferralFee;
-            
-            emit ReferralEarned(referrer, msg.sender, totalReferralFee);
-        }
-        
-        // Send remaining to fee collector
-        uint256 remainingFee = msg.value - ((msg.value * REFERRAL_PERCENTAGE) / 100);
-        if (remainingFee > 0) {
-            (bool success,) = feeCollector.call{value: remainingFee}(
-                abi.encodeWithSignature("collectNftCreationFees()")
-            );
-            require(success, "Fee collection failed");
-        }
-        
-        return tokenIds;
-    }
-    
-    // View functions for referral analytics
-    function getReferralStats(address user) external view returns (
-        uint256 totalReferred,
-        uint256 totalEarned,
-        uint256 averageEarningPerReferral
-    ) {
-        totalReferred = referralCounts[user];
-        totalEarned = referralEarnings[user];
-        averageEarningPerReferral = totalReferred > 0 ? totalEarned / totalReferred : 0;
-    }
-    
-    function getTopReferrers(uint256 limit) external view returns (
-        address[] memory referrers,
-        uint256[] memory counts
-    ) {
-        // Implementation for leaderboard (simplified here)
-        // In production, would use a more efficient data structure
-    }
-    
-    // Enhanced metadata structure
-    struct EvermarkMetadata {
-        string title;
-        string creator;
-        string metadataURI;
-        uint256 creationTime;
-        address minter;
-        address referrer;
-    }
-}
+// 2. Auto-start new week (happens automatically when funded)
 ```
 
-## 2. FeeCollector (New)
-
+### **Sunday: Week Ends**
 ```solidity
-/*
- ███████╗███████╗███████╗     ██████╗ ██████╗ ██╗     ██╗     ███████╗ ██████╗████████╗ ██████╗ ██████╗ 
- ██╔════╝██╔════╝██╔════╝    ██╔════╝██╔═══██╗██║     ██║     ██╔════╝██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗
- █████╗  █████╗  █████╗      ██║     ██║   ██║██║     ██║     █████╗  ██║        ██║   ██║   ██║██████╔╝
- ██╔══╝  ██╔══╝  ██╔══╝      ██║     ██║   ██║██║     ██║     ██╔══╝  ██║        ██║   ██║   ██║██╔══██╗
- ██║     ███████╗███████╗    ╚██████╗╚██████╔╝███████╗███████╗███████╗╚██████╗   ██║   ╚██████╔╝██║  ██║
- ╚═╝     ╚══════╝╚══════╝     ╚═════╝ ╚═════╝ ╚══════╝╚══════╝╚══════╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
-*/
+// 1. Finalize voting cycle
+evermarkVoting.startNewVotingCycle();
 
-contract FeeCollector is Ownable, ReentrancyGuard {
-    address public evermarkRewards;
-    address public treasuryWallet;
-    address public devWallet;
-    
-    uint256 public totalEmarkCollected;
-    uint256 public totalEthCollected; 
-    uint256 public totalNftFeesCollected;
-    
-    event EmarkFeesCollected(uint256 amount);
-    event EthFeesCollected(uint256 amount);
-    event NftFeesCollected(uint256 amount);
-    event FeesRouted(address destination, uint256 amount);
-    
-    // NFT creation fee collection
-    function collectNftCreationFees() external payable {
-        require(msg.value > 0, "No fees to collect");
-        totalNftFeesCollected += msg.value;
-        emit NftFeesCollected(msg.value);
-    }
-    
-    // EMARK trading fee collection  
-    function collectEmarkTradingFees(uint256 amount) external {
-        IERC20(emarkToken).transferFrom(msg.sender, address(this), amount);
-        totalEmarkCollected += amount;
-        emit EmarkFeesCollected(amount);
-    }
-    
-    // Route EMARK fees to rewards contract
-    function routeEmarkToRewards() external {
-        uint256 amount = IERC20(emarkToken).balanceOf(address(this));
-        require(amount > 0, "No EMARK to route");
-        
-        IERC20(emarkToken).transfer(evermarkRewards, amount);
-        IEvermarkRewards(evermarkRewards).distributeProtocolFees(amount);
-        
-        emit FeesRouted(evermarkRewards, amount);
-    }
-    
-    // Emergency functions for treasury management
-    function withdrawNftFeesToTreasury() external onlyOwner {
-        uint256 balance = address(this).balance;
-        payable(treasuryWallet).transfer(balance);
-    }
-}
+// 2. Finalize leaderboard
+evermarkLeaderboard.finalizeLeaderboard(weekNumber);
+
+// 3. Calculate and distribute rewards
+evermarkRewards.finalizeWeek(weekNumber);
+
+// 4. Batch calculate user rewards
+address[] memory users = getAllStakers(); // You'll implement this
+evermarkRewards.batchCalculateRewards(weekNumber, users);
 ```
 
-## 3. EvermarkRewards (Enhanced)
+## 📱 **Frontend Integration Points**
 
-```solidity
-/*
- ██████╗ ███████╗██╗    ██╗ █████╗ ██████╗ ██████╗ ███████╗
- ██╔══██╗██╔════╝██║    ██║██╔══██╗██╔══██╗██╔══██╗██╔════╝
- ██████╔╝█████╗  ██║ █╗ ██║███████║██████╔╝██║  ██║███████╗
- ██╔══██╗██╔══╝  ██║███╗██║██╔══██║██╔══██╗██║  ██║╚════██║
- ██║  ██║███████╗╚███╔███╔╝██║  ██║██║  ██║██████╔╝███████║
- ╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝
-*/
+### **User Dashboard Components**
 
-contract EvermarkRewards is Initializable, AccessControlUpgradeable {
-    // Enhanced reward tracking
-    struct RewardSource {
-        uint256 stakingRewards;
-        uint256 protocolFeeRewards; 
-        uint256 creatorRewards;
-        uint256 lastUpdated;
-    }
-    
-    mapping(address => RewardSource) public userRewards;
-    
-    // Protocol fee distribution (NEW)
-    function distributeProtocolFees(uint256 amount) external {
-        require(hasRole(FEE_DISTRIBUTOR_ROLE, msg.sender), "Not authorized");
-        
-        uint256 stakingPortion = (amount * stakingRewardPercentage) / 100;
-        uint256 creatorPortion = amount - stakingPortion;
-        
-        _distributeToStakers(stakingPortion);
-        _distributeToCreators(creatorPortion);
-    }
-    
-    // Enhanced claiming with breakdown
-    function claimAllRewards() external returns (uint256 total) {
-        RewardSource storage rewards = userRewards[msg.sender];
-        
-        uint256 stakingReward = rewards.stakingRewards;
-        uint256 protocolReward = rewards.protocolFeeRewards;
-        uint256 creatorReward = rewards.creatorRewards;
-        
-        total = stakingReward + protocolReward + creatorReward;
-        require(total > 0, "No rewards to claim");
-        
-        // Reset balances
-        rewards.stakingRewards = 0;
-        rewards.protocolFeeRewards = 0;
-        rewards.creatorRewards = 0;
-        rewards.lastUpdated = block.timestamp;
-        
-        IERC20(rewardToken).transfer(msg.sender, total);
-        
-        emit RewardsClaimed(msg.sender, stakingReward, protocolReward, creatorReward);
-    }
-    
-    // Get rewards breakdown
-    function getRewardsBreakdown(address user) external view returns (
-        uint256 staking,
-        uint256 protocolFees, 
-        uint256 creator,
-        uint256 total
-    ) {
-        RewardSource memory rewards = userRewards[user];
-        staking = rewards.stakingRewards;
-        protocolFees = rewards.protocolFeeRewards;
-        creator = rewards.creatorRewards;
-        total = staking + protocolFees + creator;
-    }
-}
-```
-
-## 4. NFTStaking (New)
-
-```solidity
-/*
- ███╗   ██╗███████╗████████╗    ███████╗████████╗ █████╗ ██╗  ██╗██╗███╗   ██╗ ██████╗ 
- ████╗  ██║██╔════╝╚══██╔══╝    ██╔════╝╚══██╔══╝██╔══██╗██║ ██╔╝██║████╗  ██║██╔════╝ 
- ██╔██╗ ██║█████╗     ██║       ███████╗   ██║   ███████║█████╔╝ ██║██╔██╗ ██║██║  ███╗
- ██║╚██╗██║██╔══╝     ██║       ╚════██║   ██║   ██╔══██║██╔═██╗ ██║██║╚██╗██║██║   ██║
- ██║ ╚████║██║        ██║       ███████║   ██║   ██║  ██║██║  ██╗██║██║ ╚████║╚██████╔╝
- ╚═╝  ╚═══╝╚═╝        ╚═╝       ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝ ╚═════╝ 
-*/
-
-contract NFTStaking is Initializable, AccessControlUpgradeable {
-    uint256 public constant LOCK_PERIOD_7_DAYS = 7 days;
-    uint256 public constant LOCK_PERIOD_14_DAYS = 14 days; 
-    uint256 public constant LOCK_PERIOD_30_DAYS = 30 days;
-    
-    struct StakedNFT {
-        address owner;
-        uint256 stakedAt;
-        uint256 lockPeriod;
-        uint256 lastVoteCount; // Votes from previous week
-        uint256 accumulatedRewards;
-    }
-    
-    mapping(uint256 => StakedNFT) public stakedNFTs;
-    
-    // Stake with lock period selection
-    function stakeNFT(uint256 tokenId, uint256 lockPeriod) external {
-        require(
-            lockPeriod == LOCK_PERIOD_7_DAYS || 
-            lockPeriod == LOCK_PERIOD_14_DAYS ||
-            lockPeriod == LOCK_PERIOD_30_DAYS,
-            "Invalid lock period"
-        );
-        
-        evermarkNFT.transferFrom(msg.sender, address(this), tokenId);
-        
-        stakedNFTs[tokenId] = StakedNFT({
-            owner: msg.sender,
-            stakedAt: block.timestamp,
-            lockPeriod: lockPeriod,
-            lastVoteCount: _getLastWeekVotes(tokenId),
-            accumulatedRewards: 0
-        });
-        
-        emit NFTStaked(msg.sender, tokenId, lockPeriod);
-    }
-    
-    // Calculate rewards based on votes received
-    function calculateRewards(uint256 tokenId) public view returns (uint256) {
-        StakedNFT memory stake = stakedNFTs[tokenId];
-        if (stake.owner == address(0)) return 0;
-        
-        uint256 baseReward = stake.lastVoteCount * BASE_REWARD_PER_VOTE;
-        uint256 multiplier = _getMultiplier(stake.lockPeriod);
-        
-        return (baseReward * multiplier) / 100;
-    }
-    
-    function _getMultiplier(uint256 lockPeriod) internal pure returns (uint256) {
-        if (lockPeriod == LOCK_PERIOD_30_DAYS) return 300; // 3x
-        if (lockPeriod == LOCK_PERIOD_14_DAYS) return 200; // 2x  
-        if (lockPeriod == LOCK_PERIOD_7_DAYS) return 150;  // 1.5x
-        return 100; // 1x
-    }
-}
-```
-
-## 5. Contract Improvements & Conveniences
-
-### A. Batch Operations
-```solidity
-// In EvermarkVoting
-function delegateVotesBatch(
-    uint256[] calldata evermarkIds,
-    uint256[] calldata amounts
-) external {
-    require(evermarkIds.length == amounts.length, "Array length mismatch");
-    for (uint256 i = 0; i < evermarkIds.length; i++) {
-        delegateVotes(evermarkIds[i], amounts[i]);
-    }
-}
-```
-
-### B. View Functions for UI
-```solidity
-// In EvermarkVoting
-function getUserDelegationSummary(address user) external view returns (
-    uint256 totalDelegated,
-    uint256 availablePower,
-    uint256 delegationCount,
-    uint256[] memory evermarkIds,
-    uint256[] memory amounts
-) {
-    // Return everything UI needs in one call
-}
-```
-
-### C. Emergency & Governance
-```solidity
-// In all contracts
-modifier onlyEmergency() {
-    require(hasRole(EMERGENCY_ROLE, msg.sender), "Emergency only");
-    _;
-}
-
-function emergencyPause() external onlyEmergency {
-    _pause();
-}
-```
-
-## 6. Frontend Integration Updates
-
-### Contract Address Mapping
+#### **1. Staking Overview**
 ```typescript
-// src/lib/contracts.ts
-export const CONTRACTS = {
-  // Core contracts (rebranded)
-  EVERMARK_NFT: "0x...",        // EvermarkNFT (with referrals)
-  EVERMARK_VOTING: "0x...",     // EvermarkVoting  
-  EVERMARK_REWARDS: "0x...",    // EvermarkRewards
-  EVERMARK_AUCTION: "0x...",    // EvermarkAuction
-  EVERMARK_LEADERBOARD: "0x...", // EvermarkLeaderboard
-  
-  // Existing
-  CARD_CATALOG: "0x...",        // Keep name
-  
-  // New contracts
-  FEE_COLLECTOR: "0x...",       // FeeCollector
-  NFT_STAKING: "0x...",         // NFTStaking
-  
-  // Test token
-  EMARK_TOKEN: "0x...",         // Test ERC20
-};
+// Get user's staking summary
+const stakingSummary = useReadContract({
+  contract: cardCatalogContract,
+  method: "getUserStakingSummary",
+  params: [userAddress],
+});
+
+// Get user's delegation status
+const { totalStaked, availablePower, delegatedPower } = stakingSummary;
+const delegationPercentage = totalStaked > 0 ? (delegatedPower / totalStaked) * 100 : 0;
 ```
 
-### Updated Hook Names & Referral Integration
+#### **2. Rewards Summary**
 ```typescript
-// Enhanced creation hook with referral support
-export function useEvermarkCreation() {
-  const createEvermark = async (metadata: EvermarkMetadata, referrer?: string) => {
-    const transaction = prepareContractCall({
-      contract: nftContract,
-      method: referrer ? "mintEvermarkWithReferral" : "mintEvermark",
-      params: referrer 
-        ? [metadataURI, title, creator, referrer]
-        : [metadataURI, title, creator],
-      value: toWei("0.0007")
-    });
-    
-    await sendTransaction(transaction);
-  };
-  
-  return { createEvermark, /* other returns */ };
-}
+// Get complete reward breakdown
+const rewardSummary = useReadContract({
+  contract: evermarkRewardsContract,
+  method: "getUserRewardSummary", 
+  params: [userAddress],
+});
 
-// New referral analytics hook
-export function useReferralStats(userAddress?: string) {
-  const { data: referralStats } = useReadContract({
-    contract: nftContract,
-    method: "getReferralStats",
-    params: [userAddress || "0x0"] as const,
-    queryOptions: { enabled: !!userAddress },
-  });
-  
-  const { data: topReferrers } = useReadContract({
-    contract: nftContract,
-    method: "getTopReferrers", 
-    params: [BigInt(10)] as const, // Top 10
-  });
-  
-  return {
-    totalReferred: referralStats?.[0] || BigInt(0),
-    totalEarned: referralStats?.[1] || BigInt(0),
-    averageEarning: referralStats?.[2] || BigInt(0),
-    topReferrers
-  };
-}
+const {
+  pendingBaseRewards,
+  pendingVariableRewards,
+  pendingNftRewards,
+  pendingCreatorRewards,
+  totalPending,
+  totalClaimed
+} = rewardSummary;
 ```
 
-### Referral UI Components
+#### **3. NFT Staking Dashboard**
 ```typescript
-// src/components/referrals/ReferralPanel.tsx
-export const ReferralPanel: React.FC = () => {
-  const { address } = useWallet();
-  const { totalReferred, totalEarned } = useReferralStats(address);
-  const [showReferralCode, setShowReferralCode] = useState(false);
-  
-  const referralLink = `https://evermarks.net?ref=${address}`;
-  
-  return (
-    <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-lg p-6">
-      <h3 className="text-lg font-semibold text-green-900 mb-4">
-        💰 Referral Program
-      </h3>
-      
-      <div className="grid grid-cols-2 gap-4 mb-4">
-        <div>
-          <p className="text-sm text-green-700">People Referred</p>
-          <p className="text-2xl font-bold text-green-900">
-            {Number(totalReferred)}
-          </p>
-        </div>
-        <div>
-          <p className="text-sm text-green-700">Earnings</p>
-          <p className="text-2xl font-bold text-green-900">
-            {toEther(totalEarned)} ETH
-          </p>
-        </div>
-      </div>
-      
-      <button
-        onClick={() => setShowReferralCode(!showReferralCode)}
-        className="w-full px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
-      >
-        {showReferralCode ? 'Hide' : 'Show'} Referral Link
-      </button>
-      
-      {showReferralCode && (
-        <div className="mt-4 p-3 bg-white rounded border">
-          <p className="text-xs text-gray-600 mb-1">Your referral link:</p>
-          <div className="flex items-center gap-2">
-            <input
-              value={referralLink}
-              readOnly
-              className="flex-1 px-2 py-1 text-sm border rounded"
-            />
-            <button
-              onClick={() => navigator.clipboard.writeText(referralLink)}
-              className="px-3 py-1 bg-green-600 text-white text-sm rounded"
-            >
-              Copy
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
+// Get user's staked NFTs
+const stakedNFTs = useReadContract({
+  contract: nftStakingContract,
+  method: "getUserStakedNFTs",
+  params: [userAddress],
+});
 
-// Enhanced create form with referral detection
-export const EnhancedCreateEvermark: React.FC = () => {
-  const [referrer, setReferrer] = useState<string | null>(null);
-  
-  // Check URL for referral code
-  useEffect(() => {
-    const urlParams = new URLSearchParams(window.location.search);
-    const refParam = urlParams.get('ref');
-    if (refParam && isValidAddress(refParam)) {
-      setReferrer(refParam);
-      // Show referral banner
-      toast.success(`Creating with referral from ${refParam.slice(0,6)}...${refParam.slice(-4)}`);
-    }
-  }, []);
-  
-  const handleSubmit = async (metadata: EvermarkMetadata) => {
-    const result = await createEvermark(metadata, referrer || undefined);
-    // Handle result...
-  };
-  
-  return (
-    <PageContainer title="Create New Evermark">
-      {referrer && (
-        <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg">
-          <p className="text-green-700 text-sm">
-            🎉 Creating with referral! The person who referred you will earn a small fee.
-          </p>
-        </div>
-      )}
-      
-      {/* Rest of create form... */}
-    </PageContainer>
-  );
-};
+// Display lock periods, rewards, unstake availability
+const { tokenIds, lockPeriods, pendingRewards, canUnstake } = stakedNFTs;
 ```
 
-## 7. Deployment Strategy
+#### **4. Weekly Leaderboard**
+```typescript
+// Get current week leaderboard
+const leaderboard = useReadContract({
+  contract: leaderboardContract,
+  method: "getLeaderboard",
+  params: [currentWeek, 50], // Top 50
+});
 
-### Contract Dependencies
-```
-1. Deploy EMARK_TOKEN (test ERC20)
-2. Deploy CARD_CATALOG 
-3. Deploy EVERMARK_NFT (needs FeeCollector address)
-4. Deploy FEE_COLLECTOR (needs EvermarkRewards address)
-5. Deploy EVERMARK_REWARDS (needs CardCatalog)
-6. Deploy EVERMARK_VOTING (needs CardCatalog + EvermarkNFT)
-7. Deploy NFT_STAKING (needs EvermarkNFT + EvermarkRewards)
-8. Deploy EVERMARK_LEADERBOARD (needs EvermarkVoting + EvermarkNFT)
-9. Deploy EVERMARK_AUCTION (needs EvermarkNFT + EvermarkRewards)
-10. Connect all references and grant roles
+// Show ranks, votes, estimated rewards
 ```
 
-### Testing Priority
-1. **Basic flow**: Mint → Vote → Rewards (no fees first)
-2. **Fee collection**: Mint with fees → Fee routing → Rewards
-3. **NFT staking**: Stake → Earn from votes → Claim
-4. **Full integration**: All systems working together
+## 🎯 **Key User Actions**
 
-## 8. Production Readiness Features
+### **Staking & Voting Flow**
+1. **Stake EMARK** → Get voting power
+2. **Delegate votes** → Earn variable rewards
+3. **Stake NFTs** → Earn vote-based rewards  
+4. **Claim rewards** → Receive EMARK tokens
 
-### Security
-- Multi-signature treasury wallet
-- Emergency pause mechanisms  
-- Role-based access control
-- Reentrancy protection on all payable functions
+### **Creation & Referral Flow**
+1. **Mint with referral** → Referrer gets 10% fee
+2. **Share referral link** → Earn from others' mints
+3. **Create popular content** → Earn creator rewards
 
-### Efficiency  
-- Batch operations for gas savings
-- Optimized storage patterns
-- View functions for complex UI queries
+## ⚙️ **Deployment Checklist**
 
-### Transparency
-- Event emissions for all important actions
-- Public view functions for fee tracking
-- Clear reward calculation methods
+### **1. Deploy Contracts (In Order)**
+```bash
+# 1. Token
+deploy EMARK_TOKEN
 
-This rewrite gives you a production-ready contract suite with proper branding, the complete revenue model, and convenience features that will make the testnet experience smooth.
+# 2. Core staking
+deploy CardCatalog(EMARK_TOKEN)
+
+# 3. Fee management  
+deploy FeeCollector(treasury, dev)
+
+# 4. Central coordinator
+deploy EvermarkRewards(CardCatalog, EvermarkVoting, EvermarkLeaderboard, NFTStaking, EMARK_TOKEN)
+
+# 5. NFT system
+deploy EvermarkNFT(FeeCollector)
+deploy EvermarkVoting(CardCatalog, EvermarkNFT)
+
+# 6. Specialized features
+deploy NFTStaking(EvermarkNFT, EvermarkVoting, EvermarkNFT, EMARK_TOKEN)
+deploy EvermarkLeaderboard(EvermarkVoting, EvermarkNFT, EvermarkRewards)
+deploy EvermarkAuction(EvermarkRewards, FeeCollector)
+```
+
+### **2. Configure References**
+```solidity
+// Set all contract references
+evermarkRewards.updateContracts(cardCatalog, voting, leaderboard, nftStaking);
+feeCollector.setEvermarkRewards(evermarkRewards);
+nftStaking.setContracts(voting, nftInterface);
+
+// Grant roles
+evermarkRewards.grantRole(REWARDS_DISTRIBUTOR_ROLE, deployer);
+leaderboard.grantRole(LEADERBOARD_MANAGER_ROLE, deployer);
+nftStaking.grantRole(REWARDS_MANAGER_ROLE, evermarkRewards);
+```
+
+### **3. Initial Setup**
+```solidity
+// Fund initial rewards
+EMARK_TOKEN.transfer(evermarkRewards, 10000000 * 1e18); // 10M EMARK
+
+// Start first week
+evermarkRewards.fundWeeklyRewards(1000000 * 1e18); // 1M for week 1
+```
+
+## 🧪 **Testing Strategy**
+
+### **Phase 1: Basic Functionality**
+- Mint NFTs with and without referrals
+- Stake EMARK tokens and delegate votes
+- Stake NFTs with different lock periods
+
+### **Phase 2: Reward Mechanics**
+- Complete a full weekly cycle
+- Test reward calculations (base + variable)
+- Verify creator reward distribution
+
+### **Phase 3: Integration Testing**
+- Test all contract interactions
+- Verify fee flows and distributions
+- Test emergency functions
+
+## 📊 **Monitoring & Analytics**
+
+### **Key Metrics to Track**
+- Weekly reward pool size
+- Staker participation rates
+- Delegation percentages  
+- NFT staking adoption
+- Creator reward distribution
+- Fee collection amounts
+
+### **Events to Index**
+- `WeeklyRewardsCalculated`
+- `RewardsClaimed`
+- `VoteDelegated`
+- `NFTStaked`
+- `EvermarkMinted`
+- `ReferralEarned`
+
+## 🎉 **Result: Complete DeFi Ecosystem**
+
+This integration delivers a **complete DeFi ecosystem** with:
+
+- **Sustainable tokenomics** (weekly reward cycles)
+- **Multiple revenue streams** (creation fees, auction fees, trading fees)
+- **Incentivized participation** (staking rewards, creator rewards)
+- **Viral growth mechanics** (referral system)
+- **Community governance** (voting system)
+- **NFT utility** (staking for rewards)
+
+**You now have a full-featured platform ready to deploy and scale!** 🚀
