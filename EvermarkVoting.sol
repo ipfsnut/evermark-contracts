@@ -38,8 +38,10 @@ contract EvermarkVoting is
     bytes32 public constant CYCLE_MANAGER_ROLE = keccak256("CYCLE_MANAGER_ROLE");
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
-    // Cycle duration (1 week)
     uint256 public constant CYCLE_DURATION = 7 days;
+    uint256 public constant MAX_BATCH_SIZE = 20;
+    uint256 public constant MAX_ACTIVE_EVERMARKS_PER_CYCLE = 1000;
+    uint256 public constant MAX_LEADERBOARD_SIZE = 100;
 
     struct VotingCycle {
         uint256 startTime;
@@ -47,13 +49,17 @@ contract EvermarkVoting is
         uint256 totalVotes;
         uint256 totalDelegations;
         bool finalized;
-        mapping(uint256 => uint256) bookmarkVotes; // bookmarkId => total votes
-        mapping(address => uint256) userTotalVotes; // user => total votes delegated this cycle
-        mapping(address => mapping(uint256 => uint256)) userBookmarkVotes; // user => bookmarkId => votes
-        uint256[] activeBookmarks; // bookmarks with votes this cycle
+        mapping(uint256 => uint256) evermarkVotes;
+        mapping(address => uint256) userTotalVotes;
+        mapping(address => mapping(uint256 => uint256)) userEvermarkVotes;
+        uint256[] activeEvermarks;
     }
 
-    // Storage
+    struct LeaderboardEntry {
+        uint256 evermarkId;
+        uint256 votes;
+    }
+
     ICardCatalog public cardCatalog;
     IEvermarkNFT public evermarkNFT;
     
@@ -61,18 +67,26 @@ contract EvermarkVoting is
     uint256 public cycleStartTime;
     
     mapping(uint256 => VotingCycle) public votingCycles;
+    mapping(uint256 => LeaderboardEntry[]) public cycleLeaderboards;
+    mapping(uint256 => bool) public leaderboardComputed;
     
-    // Global tracking
-    mapping(uint256 => uint256) public totalBookmarkVotes; // bookmarkId => all-time total votes
-    mapping(address => uint256) public totalUserDelegations; // user => all-time delegations
+    uint256 public emergencyPauseTimestamp;
     
-    // Events
+    mapping(uint256 => uint256) public totalEvermarkVotes;
+    mapping(address => uint256) public totalUserDelegations;
+    
     event NewVotingCycle(uint256 indexed cycleNumber, uint256 timestamp);
-    event VoteDelegated(address indexed user, uint256 indexed bookmarkId, uint256 amount, uint256 indexed cycle);
-    event VoteUndelegated(address indexed user, uint256 indexed bookmarkId, uint256 amount, uint256 indexed cycle);
-    event CycleFinalized(uint256 indexed cycleNumber, uint256 totalVotes, uint256 totalBookmarks);
+    event VoteDelegated(address indexed user, uint256 indexed evermarkId, uint256 amount, uint256 indexed cycle);
+    event VoteUndelegated(address indexed user, uint256 indexed evermarkId, uint256 amount, uint256 indexed cycle);
+    event CycleFinalized(uint256 indexed cycleNumber, uint256 totalVotes, uint256 totalEvermarks);
+    event LeaderboardComputed(uint256 indexed cycle, uint256 entryCount);
+    event EmergencyPauseSet(uint256 timestamp);
 
-    /// @custom:oz-upgrades-unsafe-allow constructor
+    modifier notInEmergency() {
+        require(block.timestamp > emergencyPauseTimestamp, "Emergency pause active");
+        _;
+    }
+
     constructor() {
         _disableInitializers();
     }
@@ -94,7 +108,8 @@ contract EvermarkVoting is
         cardCatalog = ICardCatalog(_cardCatalog);
         evermarkNFT = IEvermarkNFT(_evermarkNFT);
         
-        // Start first cycle
+        emergencyPauseTimestamp = 0;
+        
         currentCycle = 1;
         cycleStartTime = block.timestamp;
         
@@ -106,85 +121,75 @@ contract EvermarkVoting is
         emit NewVotingCycle(currentCycle, block.timestamp);
     }
 
-    // Delegate votes to an Evermark
-    function delegateVotes(uint256 bookmarkId, uint256 amount) external whenNotPaused nonReentrant {
+    function delegateVotes(uint256 evermarkId, uint256 amount) external whenNotPaused notInEmergency nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
-        require(evermarkNFT.exists(bookmarkId), "Bookmark does not exist");
+        require(evermarkNFT.exists(evermarkId), "Evermark does not exist");
         
-        // Check if user has enough available voting power
         uint256 availablePower = cardCatalog.getAvailableVotingPower(msg.sender);
         require(availablePower >= amount, "Insufficient voting power");
         
-        // Prevent voting on own Evermarks
-        address bookmarkCreator = evermarkNFT.getEvermarkCreator(bookmarkId);
-        require(bookmarkCreator != msg.sender, "Cannot vote on own Evermark");
+        address evermarkCreator = evermarkNFT.getEvermarkCreator(evermarkId);
+        require(evermarkCreator != msg.sender, "Cannot vote on own Evermark");
         
-        // Check and start new cycle if needed
         _checkAndStartNewCycle();
         
         VotingCycle storage cycle = votingCycles[currentCycle];
         require(!cycle.finalized, "Current cycle is finalized");
         
-        // Record vote delegation
-        cycle.bookmarkVotes[bookmarkId] += amount;
+        if (cycle.evermarkVotes[evermarkId] == 0) {
+            require(cycle.activeEvermarks.length < MAX_ACTIVE_EVERMARKS_PER_CYCLE, "Too many active evermarks this cycle");
+        }
+        
+        cycle.evermarkVotes[evermarkId] += amount;
         cycle.userTotalVotes[msg.sender] += amount;
-        cycle.userBookmarkVotes[msg.sender][bookmarkId] += amount;
+        cycle.userEvermarkVotes[msg.sender][evermarkId] += amount;
         cycle.totalVotes += amount;
         cycle.totalDelegations++;
         
-        // Add to active bookmarks if first vote
-        if (cycle.userBookmarkVotes[msg.sender][bookmarkId] == amount) {
-            _addToActiveBookmarks(currentCycle, bookmarkId);
+        if (cycle.userEvermarkVotes[msg.sender][evermarkId] == amount) {
+            _addToActiveEvermarks(currentCycle, evermarkId);
         }
         
-        // Update global tracking
-        totalBookmarkVotes[bookmarkId] += amount;
+        totalEvermarkVotes[evermarkId] += amount;
         totalUserDelegations[msg.sender] += amount;
         
-        // Update user's delegation in CardCatalog
         uint256 totalDelegated = _getUserTotalDelegatedPower(msg.sender);
         cardCatalog.updateVotingPowerDelegation(msg.sender, totalDelegated);
         
-        emit VoteDelegated(msg.sender, bookmarkId, amount, currentCycle);
+        emit VoteDelegated(msg.sender, evermarkId, amount, currentCycle);
     }
 
-    // Undelegate votes from an Evermark
-    function undelegateVotes(uint256 bookmarkId, uint256 amount) external whenNotPaused nonReentrant {
+    function undelegateVotes(uint256 evermarkId, uint256 amount) external whenNotPaused notInEmergency nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
         
-        // Check and start new cycle if needed
         _checkAndStartNewCycle();
         
         VotingCycle storage cycle = votingCycles[currentCycle];
         require(!cycle.finalized, "Current cycle is finalized");
         
-        uint256 userVotes = cycle.userBookmarkVotes[msg.sender][bookmarkId];
+        uint256 userVotes = cycle.userEvermarkVotes[msg.sender][evermarkId];
         require(userVotes >= amount, "Insufficient delegated votes");
         
-        // Update vote records
-        cycle.bookmarkVotes[bookmarkId] -= amount;
+        cycle.evermarkVotes[evermarkId] -= amount;
         cycle.userTotalVotes[msg.sender] -= amount;
-        cycle.userBookmarkVotes[msg.sender][bookmarkId] -= amount;
+        cycle.userEvermarkVotes[msg.sender][evermarkId] -= amount;
         cycle.totalVotes -= amount;
         
-        // Update global tracking
-        totalBookmarkVotes[bookmarkId] -= amount;
+        totalEvermarkVotes[evermarkId] -= amount;
         totalUserDelegations[msg.sender] -= amount;
         
-        // Update user's delegation in CardCatalog
         uint256 totalDelegated = _getUserTotalDelegatedPower(msg.sender);
         cardCatalog.updateVotingPowerDelegation(msg.sender, totalDelegated);
         
-        emit VoteUndelegated(msg.sender, bookmarkId, amount, currentCycle);
+        emit VoteUndelegated(msg.sender, evermarkId, amount, currentCycle);
     }
 
-    // Batch delegate votes to multiple Evermarks
     function delegateVotesBatch(
-        uint256[] calldata bookmarkIds,
+        uint256[] calldata evermarkIds,
         uint256[] calldata amounts
-    ) external whenNotPaused nonReentrant {
-        require(bookmarkIds.length == amounts.length, "Array length mismatch");
-        require(bookmarkIds.length <= 20, "Batch size too large");
+    ) external whenNotPaused notInEmergency nonReentrant {
+        require(evermarkIds.length == amounts.length, "Array length mismatch");
+        require(evermarkIds.length <= MAX_BATCH_SIZE, "Batch size too large");
         
         uint256 totalAmount = 0;
         for (uint256 i = 0; i < amounts.length; i++) {
@@ -194,45 +199,44 @@ contract EvermarkVoting is
         uint256 availablePower = cardCatalog.getAvailableVotingPower(msg.sender);
         require(availablePower >= totalAmount, "Insufficient voting power");
         
-        for (uint256 i = 0; i < bookmarkIds.length; i++) {
+        for (uint256 i = 0; i < evermarkIds.length; i++) {
             if (amounts[i] > 0) {
-                _delegateVotesInternal(bookmarkIds[i], amounts[i]);
+                _delegateVotesInternal(evermarkIds[i], amounts[i]);
             }
         }
     }
 
-    // Internal delegation function
-    function _delegateVotesInternal(uint256 bookmarkId, uint256 amount) internal {
-        require(evermarkNFT.exists(bookmarkId), "Bookmark does not exist");
+    function _delegateVotesInternal(uint256 evermarkId, uint256 amount) internal {
+        require(evermarkNFT.exists(evermarkId), "Evermark does not exist");
         
-        address bookmarkCreator = evermarkNFT.getEvermarkCreator(bookmarkId);
-        require(bookmarkCreator != msg.sender, "Cannot vote on own Evermark");
+        address evermarkCreator = evermarkNFT.getEvermarkCreator(evermarkId);
+        require(evermarkCreator != msg.sender, "Cannot vote on own Evermark");
         
         _checkAndStartNewCycle();
         
         VotingCycle storage cycle = votingCycles[currentCycle];
         require(!cycle.finalized, "Current cycle is finalized");
         
-        // Record vote delegation
-        cycle.bookmarkVotes[bookmarkId] += amount;
+        if (cycle.evermarkVotes[evermarkId] == 0) {
+            require(cycle.activeEvermarks.length < MAX_ACTIVE_EVERMARKS_PER_CYCLE, "Too many active evermarks this cycle");
+        }
+        
+        cycle.evermarkVotes[evermarkId] += amount;
         cycle.userTotalVotes[msg.sender] += amount;
-        cycle.userBookmarkVotes[msg.sender][bookmarkId] += amount;
+        cycle.userEvermarkVotes[msg.sender][evermarkId] += amount;
         cycle.totalVotes += amount;
         cycle.totalDelegations++;
         
-        // Add to active bookmarks if first vote
-        if (cycle.userBookmarkVotes[msg.sender][bookmarkId] == amount) {
-            _addToActiveBookmarks(currentCycle, bookmarkId);
+        if (cycle.userEvermarkVotes[msg.sender][evermarkId] == amount) {
+            _addToActiveEvermarks(currentCycle, evermarkId);
         }
         
-        // Update global tracking
-        totalBookmarkVotes[bookmarkId] += amount;
+        totalEvermarkVotes[evermarkId] += amount;
         totalUserDelegations[msg.sender] += amount;
         
-        emit VoteDelegated(msg.sender, bookmarkId, amount, currentCycle);
+        emit VoteDelegated(msg.sender, evermarkId, amount, currentCycle);
     }
 
-    // Check if new cycle should start
     function _checkAndStartNewCycle() internal {
         VotingCycle storage cycle = votingCycles[currentCycle];
         
@@ -241,17 +245,14 @@ contract EvermarkVoting is
         }
     }
 
-    // Start a new voting cycle
     function startNewVotingCycle() public onlyRole(CYCLE_MANAGER_ROLE) {
         VotingCycle storage oldCycle = votingCycles[currentCycle];
         
-        // Finalize current cycle
         if (!oldCycle.finalized) {
             oldCycle.finalized = true;
-            emit CycleFinalized(currentCycle, oldCycle.totalVotes, oldCycle.activeBookmarks.length);
+            emit CycleFinalized(currentCycle, oldCycle.totalVotes, oldCycle.activeEvermarks.length);
         }
         
-        // Start new cycle
         currentCycle++;
         cycleStartTime = block.timestamp;
         
@@ -263,46 +264,84 @@ contract EvermarkVoting is
         emit NewVotingCycle(currentCycle, block.timestamp);
     }
 
-    // Add bookmark to active list if not already present
-    function _addToActiveBookmarks(uint256 cycleNum, uint256 bookmarkId) internal {
-        uint256[] storage activeBookmarks = votingCycles[cycleNum].activeBookmarks;
+    function _addToActiveEvermarks(uint256 cycleNum, uint256 evermarkId) internal {
+        uint256[] storage activeEvermarks = votingCycles[cycleNum].activeEvermarks;
         
-        // Check if already in list
-        for (uint256 i = 0; i < activeBookmarks.length; i++) {
-            if (activeBookmarks[i] == bookmarkId) {
+        for (uint256 i = 0; i < activeEvermarks.length; i++) {
+            if (activeEvermarks[i] == evermarkId) {
                 return;
             }
         }
         
-        activeBookmarks.push(bookmarkId);
+        activeEvermarks.push(evermarkId);
     }
 
-    // Calculate user's total delegated power across all active cycles
     function _getUserTotalDelegatedPower(address user) internal view returns (uint256) {
-        // For simplicity, just return current cycle votes
-        // In production, might need to track across multiple active cycles
         return votingCycles[currentCycle].userTotalVotes[user];
     }
 
-    // View functions
+    function computeLeaderboard(uint256 cycle) external onlyRole(CYCLE_MANAGER_ROLE) {
+        require(votingCycles[cycle].finalized, "Cycle not finalized");
+        require(!leaderboardComputed[cycle], "Leaderboard already computed");
+        
+        uint256[] memory activeEvermarks = votingCycles[cycle].activeEvermarks;
+        uint256 evermarkCount = activeEvermarks.length;
+        
+        LeaderboardEntry[] memory tempEntries = new LeaderboardEntry[](evermarkCount);
+        
+        for (uint256 i = 0; i < evermarkCount; i++) {
+            uint256 evermarkId = activeEvermarks[i];
+            tempEntries[i] = LeaderboardEntry({
+                evermarkId: evermarkId,
+                votes: votingCycles[cycle].evermarkVotes[evermarkId]
+            });
+        }
+        
+        _insertionSort(tempEntries);
+        
+        uint256 entriesToStore = evermarkCount > MAX_LEADERBOARD_SIZE ? MAX_LEADERBOARD_SIZE : evermarkCount;
+        
+        delete cycleLeaderboards[cycle];
+        
+        for (uint256 i = 0; i < entriesToStore; i++) {
+            cycleLeaderboards[cycle].push(tempEntries[i]);
+        }
+        
+        leaderboardComputed[cycle] = true;
+        emit LeaderboardComputed(cycle, entriesToStore);
+    }
+
+    function _insertionSort(LeaderboardEntry[] memory arr) internal pure {
+        for (uint256 i = 1; i < arr.length; i++) {
+            LeaderboardEntry memory key = arr[i];
+            uint256 j = i;
+            
+            while (j > 0 && arr[j - 1].votes < key.votes) {
+                arr[j] = arr[j - 1];
+                j--;
+            }
+            arr[j] = key;
+        }
+    }
+
     function getCurrentCycle() external view returns (uint256) {
         return currentCycle;
     }
 
-    function getBookmarkVotes(uint256 bookmarkId) external view returns (uint256) {
-        return totalBookmarkVotes[bookmarkId];
+    function getEvermarkVotes(uint256 evermarkId) external view returns (uint256) {
+        return totalEvermarkVotes[evermarkId];
     }
 
-    function getBookmarkVotesInCycle(uint256 cycle, uint256 bookmarkId) external view returns (uint256) {
-        return votingCycles[cycle].bookmarkVotes[bookmarkId];
+    function getEvermarkVotesInCycle(uint256 cycle, uint256 evermarkId) external view returns (uint256) {
+        return votingCycles[cycle].evermarkVotes[evermarkId];
     }
 
-    function getUserVotesForBookmark(address user, uint256 bookmarkId) external view returns (uint256) {
-        return votingCycles[currentCycle].userBookmarkVotes[user][bookmarkId];
+    function getUserVotesForEvermark(address user, uint256 evermarkId) external view returns (uint256) {
+        return votingCycles[currentCycle].userEvermarkVotes[user][evermarkId];
     }
 
-    function getUserVotesInCycle(uint256 cycle, address user, uint256 bookmarkId) external view returns (uint256) {
-        return votingCycles[cycle].userBookmarkVotes[user][bookmarkId];
+    function getUserVotesInCycle(uint256 cycle, address user, uint256 evermarkId) external view returns (uint256) {
+        return votingCycles[cycle].userEvermarkVotes[user][evermarkId];
     }
 
     function getTotalUserVotesInCurrentCycle(address user) external view returns (uint256) {
@@ -313,8 +352,8 @@ contract EvermarkVoting is
         return votingCycles[cycle].userTotalVotes[user];
     }
 
-    function getBookmarksWithVotesInCycle(uint256 cycle) external view returns (uint256[] memory) {
-        return votingCycles[cycle].activeBookmarks;
+    function getEvermarksWithVotesInCycle(uint256 cycle) external view returns (uint256[] memory) {
+        return votingCycles[cycle].activeEvermarks;
     }
 
     function getRemainingVotingPower(address user) external view returns (uint256) {
@@ -335,7 +374,7 @@ contract EvermarkVoting is
         uint256 totalVotes,
         uint256 totalDelegations,
         bool finalized,
-        uint256 activeBookmarksCount
+        uint256 activeEvermarksCount
     ) {
         VotingCycle storage cycleData = votingCycles[cycle];
         return (
@@ -344,51 +383,110 @@ contract EvermarkVoting is
             cycleData.totalVotes,
             cycleData.totalDelegations,
             cycleData.finalized,
-            cycleData.activeBookmarks.length
+            cycleData.activeEvermarks.length
         );
     }
 
-    // Get top bookmarks for a cycle (for leaderboard)
-    function getTopBookmarksInCycle(uint256 cycle, uint256 limit) external view returns (
-        uint256[] memory bookmarkIds,
+    function getTopEvermarksInCycle(uint256 cycle, uint256 limit) external view returns (
+        uint256[] memory evermarkIds,
         uint256[] memory votes
     ) {
-        uint256[] memory activeBookmarks = votingCycles[cycle].activeBookmarks;
-        uint256 count = activeBookmarks.length > limit ? limit : activeBookmarks.length;
+        require(leaderboardComputed[cycle], "Leaderboard not computed for this cycle");
         
-        bookmarkIds = new uint256[](count);
+        LeaderboardEntry[] memory leaderboard = cycleLeaderboards[cycle];
+        uint256 count = leaderboard.length > limit ? limit : leaderboard.length;
+        
+        evermarkIds = new uint256[](count);
         votes = new uint256[](count);
         
-        // Simple sorting (in production, use more efficient sorting)
+        for (uint256 i = 0; i < count; i++) {
+            evermarkIds[i] = leaderboard[i].evermarkId;
+            votes[i] = leaderboard[i].votes;
+        }
+        
+        return (evermarkIds, votes);
+    }
+
+    function getTopEvermarksInCycleFallback(uint256 cycle, uint256 limit) external view returns (
+        uint256[] memory evermarkIds,
+        uint256[] memory votes
+    ) {
+        uint256[] memory activeEvermarks = votingCycles[cycle].activeEvermarks;
+        require(activeEvermarks.length <= 500, "Too many evermarks for fallback method");
+        
+        uint256 count = activeEvermarks.length > limit ? limit : activeEvermarks.length;
+        
+        evermarkIds = new uint256[](count);
+        votes = new uint256[](count);
+        
         for (uint256 i = 0; i < count; i++) {
             uint256 maxVotes = 0;
             uint256 maxIndex = 0;
             
-            for (uint256 j = 0; j < activeBookmarks.length; j++) {
-                uint256 bookmarkVotes = votingCycles[cycle].bookmarkVotes[activeBookmarks[j]];
-                if (bookmarkVotes > maxVotes) {
+            for (uint256 j = 0; j < activeEvermarks.length; j++) {
+                uint256 evermarkVotes = votingCycles[cycle].evermarkVotes[activeEvermarks[j]];
+                if (evermarkVotes > maxVotes) {
                     bool alreadyIncluded = false;
                     for (uint256 k = 0; k < i; k++) {
-                        if (bookmarkIds[k] == activeBookmarks[j]) {
+                        if (evermarkIds[k] == activeEvermarks[j]) {
                             alreadyIncluded = true;
                             break;
                         }
                     }
                     if (!alreadyIncluded) {
-                        maxVotes = bookmarkVotes;
+                        maxVotes = evermarkVotes;
                         maxIndex = j;
                     }
                 }
             }
             
             if (maxVotes > 0) {
-                bookmarkIds[i] = activeBookmarks[maxIndex];
+                evermarkIds[i] = activeEvermarks[maxIndex];
                 votes[i] = maxVotes;
             }
         }
     }
 
-    // Admin functions
+    function getBookmarkVotes(uint256 bookmarkId) external view returns (uint256) {
+        return totalEvermarkVotes[bookmarkId];
+    }
+
+    function getBookmarkVotesInCycle(uint256 cycle, uint256 bookmarkId) external view returns (uint256) {
+        return votingCycles[cycle].evermarkVotes[bookmarkId];
+    }
+
+    function getUserVotesForBookmark(address user, uint256 bookmarkId) external view returns (uint256) {
+        return votingCycles[currentCycle].userEvermarkVotes[user][bookmarkId];
+    }
+
+    function getBookmarksWithVotesInCycle(uint256 cycle) external view returns (uint256[] memory) {
+        return votingCycles[cycle].activeEvermarks;
+    }
+
+    function getTopBookmarksInCycle(uint256 cycle, uint256 limit) external view returns (
+        uint256[] memory bookmarkIds,
+        uint256[] memory votes
+    ) {
+        return this.getTopEvermarksInCycle(cycle, limit);
+    }
+
+    function getTopBookmarksInCycleFallback(uint256 cycle, uint256 limit) external view returns (
+        uint256[] memory bookmarkIds,
+        uint256[] memory votes
+    ) {
+        return this.getTopEvermarksInCycleFallback(cycle, limit);
+    }
+
+    function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyRole(ADMIN_ROLE) {
+        emergencyPauseTimestamp = pauseUntilTimestamp;
+        emit EmergencyPauseSet(pauseUntilTimestamp);
+    }
+
+    function clearEmergencyPause() external onlyRole(ADMIN_ROLE) {
+        emergencyPauseTimestamp = 0;
+        emit EmergencyPauseSet(0);
+    }
+
     function updateCardCatalog(address _cardCatalog) external onlyRole(ADMIN_ROLE) {
         require(_cardCatalog != address(0), "Invalid address");
         cardCatalog = ICardCatalog(_cardCatalog);
@@ -415,20 +513,18 @@ contract EvermarkVoting is
         _unpause();
     }
 
-    // Emergency cycle management
     function emergencyFinalizeCycle(uint256 cycle) external onlyRole(ADMIN_ROLE) {
         VotingCycle storage cycleData = votingCycles[cycle];
         require(!cycleData.finalized, "Cycle already finalized");
         
         cycleData.finalized = true;
-        emit CycleFinalized(cycle, cycleData.totalVotes, cycleData.activeBookmarks.length);
+        emit CycleFinalized(cycle, cycleData.totalVotes, cycleData.activeEvermarks.length);
     }
 
     function emergencyStartNewCycle() external onlyRole(ADMIN_ROLE) {
         startNewVotingCycle();
     }
 
-    // Check if cycle should auto-advance
     function checkAndStartNewCycle() external returns (bool) {
         VotingCycle storage cycle = votingCycles[currentCycle];
         
@@ -440,7 +536,6 @@ contract EvermarkVoting is
         return false;
     }
 
-    // Required overrides
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
 
     function supportsInterface(bytes4 interfaceId) public view override returns (bool) {

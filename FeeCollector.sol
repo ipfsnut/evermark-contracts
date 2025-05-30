@@ -19,54 +19,150 @@ interface IEvermarkRewards {
 }
 
 contract FeeCollector is Ownable, ReentrancyGuard {
-    // Contracts
     address public evermarkRewards;
     address public treasuryWallet;
     address public devWallet;
     IERC20 public emarkToken;
     
-    // Fee tracking
     uint256 public totalEmarkCollected;
     uint256 public totalEthCollected; 
     uint256 public totalNftFeesCollected;
+    uint256 public totalAuctionFeesCollected;
     
-    // Fee split percentages (basis points, 10000 = 100%)
-    uint256 public treasuryPercentage = 3000; // 30%
-    uint256 public devPercentage = 1000;      // 10%
-    uint256 public rewardsPercentage = 6000;  // 60%
+    uint256 public pendingTreasuryEth;
+    uint256 public pendingDevEth;
+    uint256 public pendingRewardsEth;
     
-    // Events
+    uint256 public treasuryPercentage = 3000;
+    uint256 public devPercentage = 1000;
+    uint256 public rewardsPercentage = 6000;
+    
+    uint256 public emergencyPauseTimestamp;
+    
     event EmarkFeesCollected(uint256 amount);
     event EthFeesCollected(uint256 amount);
     event NftFeesCollected(uint256 amount);
+    event AuctionFeesCollected(uint256 amount);
     event FeesRouted(address indexed destination, uint256 amount, string feeType);
     event FeePercentagesUpdated(uint256 treasury, uint256 dev, uint256 rewards);
     event ContractUpdated(string contractType, address indexed oldAddress, address indexed newAddress);
+    event FeesStored(uint256 treasury, uint256 dev, uint256 rewards);
+    event EmergencyPauseSet(uint256 timestamp);
+    
+    modifier notInEmergency() {
+        require(block.timestamp > emergencyPauseTimestamp, "Emergency pause active");
+        _;
+    }
     
     constructor(
         address _treasuryWallet,
         address _devWallet
-    ) {
+    ) Ownable(msg.sender) {
         require(_treasuryWallet != address(0), "Invalid treasury wallet");
         require(_devWallet != address(0), "Invalid dev wallet");
         
         treasuryWallet = _treasuryWallet;
         devWallet = _devWallet;
+        emergencyPauseTimestamp = 0;
     }
     
-    // NFT creation fee collection - called by EvermarkNFT contract
-    function collectNftCreationFees() external payable {
+    function collectNftCreationFees() external payable notInEmergency {
         require(msg.value > 0, "No fees to collect");
         totalNftFeesCollected += msg.value;
         totalEthCollected += msg.value;
         emit NftFeesCollected(msg.value);
         
-        // Automatically distribute ETH fees
-        _distributeEthFees(msg.value);
+        _storeFees(msg.value);
     }
     
-    // EMARK trading fee collection - called by DEX or other contracts
-    function collectEmarkTradingFees(uint256 amount) external {
+    function collectAuctionFees() external payable notInEmergency {
+        require(msg.value > 0, "No fees to collect");
+        totalAuctionFeesCollected += msg.value;
+        totalEthCollected += msg.value;
+        emit AuctionFeesCollected(msg.value);
+        
+        _storeFees(msg.value);
+    }
+    
+    function _storeFees(uint256 amount) internal {
+        if (amount == 0) return;
+        
+        uint256 toTreasury = (amount * treasuryPercentage) / 10000;
+        uint256 toDev = (amount * devPercentage) / 10000;
+        uint256 toRewards = amount - toTreasury - toDev;
+        
+        pendingTreasuryEth += toTreasury;
+        pendingDevEth += toDev;
+        pendingRewardsEth += toRewards;
+        
+        emit FeesStored(toTreasury, toDev, toRewards);
+    }
+    
+    function distributePendingEthFees() external nonReentrant notInEmergency {
+        uint256 toTreasury = pendingTreasuryEth;
+        uint256 toDev = pendingDevEth;
+        uint256 toRewards = pendingRewardsEth;
+        
+        pendingTreasuryEth = 0;
+        pendingDevEth = 0;
+        pendingRewardsEth = 0;
+        
+        if (toTreasury > 0 && treasuryWallet != address(0)) {
+            (bool success, ) = payable(treasuryWallet).call{value: toTreasury}("");
+            if (success) {
+                emit FeesRouted(treasuryWallet, toTreasury, "Treasury ETH");
+            } else {
+                pendingTreasuryEth += toTreasury;
+            }
+        }
+        
+        if (toDev > 0 && devWallet != address(0)) {
+            (bool success, ) = payable(devWallet).call{value: toDev}("");
+            if (success) {
+                emit FeesRouted(devWallet, toDev, "Dev ETH");
+            } else {
+                pendingDevEth += toDev;
+            }
+        }
+        
+        if (toRewards > 0) {
+            emit FeesRouted(address(this), toRewards, "Rewards ETH Reserve");
+        }
+    }
+    
+    function distributeTreasuryFees() external nonReentrant notInEmergency {
+        uint256 amount = pendingTreasuryEth;
+        require(amount > 0, "No treasury fees to distribute");
+        require(treasuryWallet != address(0), "Treasury wallet not set");
+        
+        pendingTreasuryEth = 0;
+        
+        (bool success, ) = payable(treasuryWallet).call{value: amount}("");
+        if (success) {
+            emit FeesRouted(treasuryWallet, amount, "Treasury ETH");
+        } else {
+            pendingTreasuryEth = amount;
+            revert("Treasury transfer failed");
+        }
+    }
+    
+    function distributeDevFees() external nonReentrant notInEmergency {
+        uint256 amount = pendingDevEth;
+        require(amount > 0, "No dev fees to distribute");
+        require(devWallet != address(0), "Dev wallet not set");
+        
+        pendingDevEth = 0;
+        
+        (bool success, ) = payable(devWallet).call{value: amount}("");
+        if (success) {
+            emit FeesRouted(devWallet, amount, "Dev ETH");
+        } else {
+            pendingDevEth = amount;
+            revert("Dev transfer failed");
+        }
+    }
+    
+    function collectEmarkTradingFees(uint256 amount) external notInEmergency {
         require(amount > 0, "No fees to collect");
         require(address(emarkToken) != address(0), "EMARK token not set");
         
@@ -75,8 +171,7 @@ contract FeeCollector is Ownable, ReentrancyGuard {
         emit EmarkFeesCollected(amount);
     }
     
-    // Manual EMARK fee collection with approval
-    function depositEmarkFees(uint256 amount) external {
+    function depositEmarkFees(uint256 amount) external notInEmergency {
         require(amount > 0, "No fees to deposit");
         require(address(emarkToken) != address(0), "EMARK token not set");
         
@@ -85,57 +180,23 @@ contract FeeCollector is Ownable, ReentrancyGuard {
         emit EmarkFeesCollected(amount);
     }
     
-    // Route EMARK fees to rewards contract
-    function routeEmarkToRewards() external nonReentrant {
+    function routeEmarkToRewards() external nonReentrant notInEmergency {
         require(address(emarkToken) != address(0), "EMARK token not set");
         require(evermarkRewards != address(0), "Rewards contract not set");
         
         uint256 amount = emarkToken.balanceOf(address(this));
         require(amount > 0, "No EMARK to route");
         
-        emarkToken.transfer(evermarkRewards, amount);
-        IEvermarkRewards(evermarkRewards).distributeProtocolFees(amount);
+        bool transferSuccess = emarkToken.transfer(evermarkRewards, amount);
+        require(transferSuccess, "EMARK transfer failed");
         
-        emit FeesRouted(evermarkRewards, amount, "EMARK");
-    }
-    
-    // Internal function to distribute ETH fees immediately
-    function _distributeEthFees(uint256 amount) internal {
-        if (amount == 0) return;
-        
-        uint256 toTreasury = (amount * treasuryPercentage) / 10000;
-        uint256 toDev = (amount * devPercentage) / 10000;
-        uint256 toRewards = amount - toTreasury - toDev; // Remaining goes to rewards
-        
-        // Send to treasury
-        if (toTreasury > 0 && treasuryWallet != address(0)) {
-            (bool success, ) = payable(treasuryWallet).call{value: toTreasury}("");
-            require(success, "Treasury transfer failed");
-            emit FeesRouted(treasuryWallet, toTreasury, "Treasury ETH");
-        }
-        
-        // Send to dev
-        if (toDev > 0 && devWallet != address(0)) {
-            (bool success, ) = payable(devWallet).call{value: toDev}("");
-            require(success, "Dev transfer failed");
-            emit FeesRouted(devWallet, toDev, "Dev ETH");
-        }
-        
-        // Keep remaining for potential rewards contract (if implemented for ETH)
-        if (toRewards > 0) {
-            emit FeesRouted(address(this), toRewards, "Rewards ETH Reserve");
+        try IEvermarkRewards(evermarkRewards).distributeProtocolFees(amount) {
+            emit FeesRouted(evermarkRewards, amount, "EMARK");
+        } catch {
+            emit FeesRouted(evermarkRewards, amount, "EMARK (notification failed)");
         }
     }
     
-    // Manual distribution of accumulated ETH fees
-    function distributeAccumulatedEthFees() external nonReentrant onlyOwner {
-        uint256 balance = address(this).balance;
-        require(balance > 0, "No ETH to distribute");
-        
-        _distributeEthFees(balance);
-    }
-    
-    // Update fee percentages
     function updateFeePercentages(
         uint256 _treasuryPercentage,
         uint256 _devPercentage,
@@ -153,7 +214,6 @@ contract FeeCollector is Ownable, ReentrancyGuard {
         emit FeePercentagesUpdated(_treasuryPercentage, _devPercentage, _rewardsPercentage);
     }
     
-    // Update contract addresses
     function setEvermarkRewards(address _evermarkRewards) external onlyOwner {
         address oldAddress = evermarkRewards;
         evermarkRewards = _evermarkRewards;
@@ -180,7 +240,6 @@ contract FeeCollector is Ownable, ReentrancyGuard {
         emit ContractUpdated("DevWallet", oldAddress, _devWallet);
     }
     
-    // View functions
     function getFeeBreakdown(uint256 amount) external view returns (
         uint256 treasuryAmount,
         uint256 devAmount,
@@ -194,16 +253,44 @@ contract FeeCollector is Ownable, ReentrancyGuard {
     function getCollectedFees() external view returns (
         uint256 emarkFees,
         uint256 ethFees,
-        uint256 nftFees
+        uint256 nftFees,
+        uint256 auctionFees
     ) {
-        return (totalEmarkCollected, totalEthCollected, totalNftFeesCollected);
+        return (totalEmarkCollected, totalEthCollected, totalNftFeesCollected, totalAuctionFeesCollected);
     }
     
-    // Emergency functions
+    function getPendingEthFees() external view returns (
+        uint256 treasury,
+        uint256 dev,
+        uint256 rewards,
+        uint256 total
+    ) {
+        return (
+            pendingTreasuryEth,
+            pendingDevEth,
+            pendingRewardsEth,
+            pendingTreasuryEth + pendingDevEth + pendingRewardsEth
+        );
+    }
+    
+    function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyOwner {
+        emergencyPauseTimestamp = pauseUntilTimestamp;
+        emit EmergencyPauseSet(pauseUntilTimestamp);
+    }
+    
+    function clearEmergencyPause() external onlyOwner {
+        emergencyPauseTimestamp = 0;
+        emit EmergencyPauseSet(0);
+    }
+    
     function emergencyWithdrawEth(address payable recipient) external onlyOwner {
         require(recipient != address(0), "Invalid recipient");
         uint256 balance = address(this).balance;
         require(balance > 0, "No ETH to withdraw");
+        
+        pendingTreasuryEth = 0;
+        pendingDevEth = 0;
+        pendingRewardsEth = 0;
         
         (bool success, ) = recipient.call{value: balance}("");
         require(success, "Emergency withdrawal failed");
@@ -220,32 +307,35 @@ contract FeeCollector is Ownable, ReentrancyGuard {
         IERC20(token).transfer(recipient, amount);
     }
     
-    // Batch operations for efficiency
-    function batchDistributeEmarkFees() external nonReentrant {
+    function batchDistributeEmarkFees() external nonReentrant notInEmergency {
         require(address(emarkToken) != address(0), "EMARK token not set");
         require(evermarkRewards != address(0), "Rewards contract not set");
         
         uint256 emarkBalance = emarkToken.balanceOf(address(this));
         if (emarkBalance > 0) {
-            routeEmarkToRewards();
+            try this.routeEmarkToRewards() {
+            } catch {
+            }
         }
         
-        uint256 ethBalance = address(this).balance;
-        if (ethBalance > 0) {
-            _distributeEthFees(ethBalance);
+        try this.distributePendingEthFees() {
+        } catch {
         }
     }
     
-    // Allow contract to receive ETH
     receive() external payable {
-        totalEthCollected += msg.value;
-        emit EthFeesCollected(msg.value);
-        _distributeEthFees(msg.value);
+        if (msg.value > 0) {
+            totalEthCollected += msg.value;
+            emit EthFeesCollected(msg.value);
+            _storeFees(msg.value);
+        }
     }
     
     fallback() external payable {
-        totalEthCollected += msg.value;
-        emit EthFeesCollected(msg.value);
-        _distributeEthFees(msg.value);
+        if (msg.value > 0) {
+            totalEthCollected += msg.value;
+            emit EthFeesCollected(msg.value);
+            _storeFees(msg.value);
+        }
     }
 }

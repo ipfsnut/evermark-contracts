@@ -59,36 +59,43 @@ contract EvermarkLeaderboard is
         uint256 rank;
     }
 
-    struct CycleLeaderboard {
+    // Simplified cycle data - no nested mappings
+    struct CycleData {
         uint256 cycle;
         uint256 totalParticipants;
         uint256 totalVotes;
         uint256 rewardPool;
         bool finalized;
         uint256 finalizedAt;
-        mapping(uint256 => LeaderboardEntry) entries; // rank => entry
-        mapping(uint256 => uint256) evermarkRanks; // evermarkId => rank
     }
 
-    // Storage
+    // Constants
+    uint256 public constant MAX_LEADERBOARD_SIZE = 50; // Reduced from 100
+    uint256 public constant MAX_BATCH_SIZE = 20; // Reduced from 50
+
+    // Storage - simplified
     IEvermarkVoting public evermarkVoting;
     IEvermarkNFT public evermarkNFT;
     IEvermarkRewards public evermarkRewards;
     
-    mapping(uint256 => CycleLeaderboard) public cycleLeaderboards;
-    uint256 public currentProcessedCycle;
+    mapping(uint256 => CycleData) public cycleData;
+    mapping(uint256 => mapping(uint256 => LeaderboardEntry)) public leaderboardEntries; // cycle => rank => entry
+    mapping(uint256 => mapping(uint256 => uint256)) public evermarkRanks; // cycle => evermarkId => rank
     
-    // Reward configuration
-    uint256 public constant TOP_10_REWARD_PERCENTAGE = 7000; // 70% to top 10
-    uint256 public constant TOP_50_REWARD_PERCENTAGE = 2000; // 20% to top 11-50
-    uint256 public constant PARTICIPATION_REWARD_PERCENTAGE = 1000; // 10% to others
+    uint256 public currentProcessedCycle;
+    uint256 public emergencyPauseTimestamp;
     
     // Events
-    event LeaderboardFinalized(uint256 indexed cycle, uint256 totalParticipants, uint256 rewardPool);
+    event LeaderboardFinalized(uint256 indexed cycle, uint256 totalParticipants);
     event CreatorRewardsDistributed(uint256 indexed cycle, uint256 totalRewards, uint256 recipientCount);
     event LeaderboardConfigUpdated(address voting, address nft, address rewards);
+    event EmergencyPauseSet(uint256 timestamp);
 
-    /// @custom:oz-upgrades-unsafe-allow constructor
+    modifier notInEmergency() {
+        require(block.timestamp > emergencyPauseTimestamp, "Emergency pause active");
+        _;
+    }
+
     constructor() {
         _disableInitializers();
     }
@@ -110,151 +117,158 @@ contract EvermarkLeaderboard is
 
         evermarkVoting = IEvermarkVoting(_evermarkVoting);
         evermarkNFT = IEvermarkNFT(_evermarkNFT);
-        evermarkRewards = IEvermarkRewards(_evermarkRewards);
+        if (_evermarkRewards != address(0)) {
+            evermarkRewards = IEvermarkRewards(_evermarkRewards);
+        }
         
         currentProcessedCycle = 0;
+        emergencyPauseTimestamp = 0;
     }
 
-    // Finalize leaderboard for a completed cycle
-    function finalizeLeaderboard(uint256 cycle) external onlyRole(LEADERBOARD_MANAGER_ROLE) whenNotPaused {
+    // Simplified finalize function
+    function finalizeLeaderboard(uint256 cycle) external onlyRole(LEADERBOARD_MANAGER_ROLE) whenNotPaused notInEmergency {
         require(cycle > 0, "Invalid cycle");
-        require(!cycleLeaderboards[cycle].finalized, "Already finalized");
+        require(!cycleData[cycle].finalized, "Already finalized");
         
-        // Verify cycle is complete
+        // Get voting data
         (, uint256 endTime, uint256 totalVotes,, bool votingFinalized,) = evermarkVoting.getCycleInfo(cycle);
         require(votingFinalized, "Voting cycle not finalized");
         require(block.timestamp >= endTime, "Cycle not ended");
         
-        // Get top evermarks (up to 100)
-        (uint256[] memory evermarkIds, uint256[] memory votes) = evermarkVoting.getTopBookmarksInCycle(cycle, 100);
+        // Get top evermarks
+        (uint256[] memory evermarkIds, uint256[] memory votes) = evermarkVoting.getTopBookmarksInCycle(cycle, MAX_LEADERBOARD_SIZE);
         
-        CycleLeaderboard storage leaderboard = cycleLeaderboards[cycle];
-        leaderboard.cycle = cycle;
-        leaderboard.totalVotes = totalVotes;
-        leaderboard.totalParticipants = evermarkIds.length;
-        leaderboard.finalized = true;
-        leaderboard.finalizedAt = block.timestamp;
+        // Store cycle data
+        cycleData[cycle] = CycleData({
+            cycle: cycle,
+            totalParticipants: evermarkIds.length,
+            totalVotes: totalVotes,
+            rewardPool: 0,
+            finalized: true,
+            finalizedAt: block.timestamp
+        });
         
-        // Store leaderboard entries
+        // Store entries one by one to avoid stack depth
         for (uint256 i = 0; i < evermarkIds.length; i++) {
-            uint256 evermarkId = evermarkIds[i];
-            uint256 rank = i + 1;
-            
-            if (evermarkNFT.exists(evermarkId)) {
-                address creator = evermarkNFT.getEvermarkCreator(evermarkId);
-                
-                leaderboard.entries[rank] = LeaderboardEntry({
-                    evermarkId: evermarkId,
-                    creator: creator,
-                    votes: votes[i],
-                    rank: rank
-                });
-                
-                leaderboard.evermarkRanks[evermarkId] = rank;
-            }
+            _storeEntry(cycle, evermarkIds[i], votes[i], i + 1);
         }
         
         currentProcessedCycle = cycle;
-        emit LeaderboardFinalized(cycle, evermarkIds.length, 0); // rewardPool calculated separately
+        emit LeaderboardFinalized(cycle, evermarkIds.length);
     }
 
-    // Distribute creator rewards based on leaderboard ranking
-    function distributeCreatorRewards(uint256 cycle, uint256 rewardPool) external onlyRole(LEADERBOARD_MANAGER_ROLE) {
-        CycleLeaderboard storage leaderboard = cycleLeaderboards[cycle];
-        require(leaderboard.finalized, "Leaderboard not finalized");
+    // Simple helper to store single entry
+    function _storeEntry(uint256 cycle, uint256 evermarkId, uint256 voteCount, uint256 rank) internal {
+        if (evermarkNFT.exists(evermarkId)) {
+            address creator = evermarkNFT.getEvermarkCreator(evermarkId);
+            
+            leaderboardEntries[cycle][rank] = LeaderboardEntry({
+                evermarkId: evermarkId,
+                creator: creator,
+                votes: voteCount,
+                rank: rank
+            });
+            
+            evermarkRanks[cycle][evermarkId] = rank;
+        }
+    }
+
+    // Simplified reward distribution - no complex batching
+    function distributeCreatorRewards(uint256 cycle, uint256 rewardPool) external onlyRole(LEADERBOARD_MANAGER_ROLE) notInEmergency {
+        require(cycleData[cycle].finalized, "Leaderboard not finalized");
         require(rewardPool > 0, "No rewards to distribute");
         
-        uint256 participantCount = leaderboard.totalParticipants;
+        uint256 participantCount = cycleData[cycle].totalParticipants;
         if (participantCount == 0) return;
         
-        // Calculate reward distributions
-        uint256 top10Pool = (rewardPool * TOP_10_REWARD_PERCENTAGE) / 10000;
-        uint256 top50Pool = (rewardPool * TOP_50_REWARD_PERCENTAGE) / 10000;
-        uint256 participationPool = rewardPool - top10Pool - top50Pool;
+        // Simple distribution: equal rewards for top 10, then smaller amounts for others
+        uint256 top10Reward = (rewardPool * 70) / 100; // 70% for top 10
+        uint256 otherReward = rewardPool - top10Reward; // 30% for others
         
-        address[] memory creators = new address[](participantCount);
-        uint256[] memory amounts = new uint256[](participantCount);
-        uint256 recipientCount = 0;
+        uint256 top10Count = participantCount > 10 ? 10 : participantCount;
+        uint256 otherCount = participantCount > 10 ? participantCount - 10 : 0;
         
-        // Distribute rewards by tier
-        for (uint256 rank = 1; rank <= participantCount && rank <= 100; rank++) {
-            LeaderboardEntry memory entry = leaderboard.entries[rank];
-            if (entry.creator == address(0)) continue;
+        uint256 rewardPerTop10 = top10Count > 0 ? top10Reward / top10Count : 0;
+        uint256 rewardPerOther = otherCount > 0 ? otherReward / otherCount : 0;
+        
+        // Distribute in small batches
+        _distributeInBatches(cycle, rewardPerTop10, rewardPerOther, participantCount);
+        
+        cycleData[cycle].rewardPool = rewardPool;
+        emit CreatorRewardsDistributed(cycle, rewardPool, participantCount);
+    }
+
+    // Simple batch distribution
+    function _distributeInBatches(uint256 cycle, uint256 top10Reward, uint256 otherReward, uint256 totalCount) internal {
+        if (address(evermarkRewards) == address(0)) return;
+        
+        uint256 batchSize = 10; // Small batches
+        
+        for (uint256 start = 1; start <= totalCount; start += batchSize) {
+            uint256 end = start + batchSize - 1;
+            if (end > totalCount) end = totalCount;
             
-            uint256 reward = 0;
+            _processSingleBatch(cycle, start, end, top10Reward, otherReward);
+        }
+    }
+
+    // Process single batch - minimal variables
+    function _processSingleBatch(uint256 cycle, uint256 startRank, uint256 endRank, uint256 top10Reward, uint256 otherReward) internal {
+        uint256 batchSize = endRank - startRank + 1;
+        address[] memory creators = new address[](batchSize);
+        uint256[] memory amounts = new uint256[](batchSize);
+        uint256 count = 0;
+        
+        for (uint256 rank = startRank; rank <= endRank; rank++) {
+            LeaderboardEntry memory entry = leaderboardEntries[cycle][rank];
+            if (entry.creator != address(0)) {
+                creators[count] = entry.creator;
+                amounts[count] = rank <= 10 ? top10Reward : otherReward;
+                count++;
+            }
+        }
+        
+        if (count > 0) {
+            // Trim arrays
+            address[] memory finalCreators = new address[](count);
+            uint256[] memory finalAmounts = new uint256[](count);
             
-            if (rank <= 10) {
-                // Top 10: Weighted distribution based on votes
-                reward = _calculateWeightedReward(top10Pool, entry.votes, _getTierTotalVotes(cycle, 1, 10));
-            } else if (rank <= 50) {
-                // Rank 11-50: Equal distribution
-                uint256 tier2Count = participantCount >= 50 ? 40 : (participantCount - 10);
-                reward = tier2Count > 0 ? top50Pool / tier2Count : 0;
-            } else {
-                // Rank 51+: Equal participation reward
-                uint256 tier3Count = participantCount - 50;
-                reward = tier3Count > 0 ? participationPool / tier3Count : 0;
+            for (uint256 i = 0; i < count; i++) {
+                finalCreators[i] = creators[i];
+                finalAmounts[i] = amounts[i];
             }
             
-            if (reward > 0) {
-                creators[recipientCount] = entry.creator;
-                amounts[recipientCount] = reward;
-                recipientCount++;
+            try evermarkRewards.distributeCreatorRewards(finalCreators, finalAmounts) {
+                // Success
+            } catch {
+                // Failed but continue
             }
         }
-        
-        // Trim arrays to actual size
-        address[] memory finalCreators = new address[](recipientCount);
-        uint256[] memory finalAmounts = new uint256[](recipientCount);
-        
-        for (uint256 i = 0; i < recipientCount; i++) {
-            finalCreators[i] = creators[i];
-            finalAmounts[i] = amounts[i];
-        }
-        
-        // Distribute through rewards contract
-        if (recipientCount > 0) {
-            evermarkRewards.distributeCreatorRewards(finalCreators, finalAmounts);
-            leaderboard.rewardPool = rewardPool;
-            emit CreatorRewardsDistributed(cycle, rewardPool, recipientCount);
-        }
     }
 
-    // Calculate weighted reward based on votes within a tier
-    function _calculateWeightedReward(uint256 tierPool, uint256 userVotes, uint256 tierTotalVotes) internal pure returns (uint256) {
-        if (tierTotalVotes == 0) return 0;
-        return (tierPool * userVotes) / tierTotalVotes;
-    }
-
-    // Get total votes for a specific tier (rank range)
-    function _getTierTotalVotes(uint256 cycle, uint256 startRank, uint256 endRank) internal view returns (uint256) {
-        uint256 total = 0;
-        CycleLeaderboard storage leaderboard = cycleLeaderboards[cycle];
-        
-        for (uint256 rank = startRank; rank <= endRank && rank <= leaderboard.totalParticipants; rank++) {
-            total += leaderboard.entries[rank].votes;
-        }
-        
-        return total;
-    }
-
-    // View functions
+    // Simple view functions
     function getLeaderboard(uint256 cycle, uint256 limit) external view returns (LeaderboardEntry[] memory) {
-        CycleLeaderboard storage leaderboard = cycleLeaderboards[cycle];
-        require(leaderboard.finalized, "Leaderboard not finalized");
+        require(cycleData[cycle].finalized, "Leaderboard not finalized");
         
-        uint256 count = limit > leaderboard.totalParticipants ? leaderboard.totalParticipants : limit;
+        uint256 maxLimit = limit > MAX_LEADERBOARD_SIZE ? MAX_LEADERBOARD_SIZE : limit;
+        uint256 count = maxLimit > cycleData[cycle].totalParticipants ? cycleData[cycle].totalParticipants : maxLimit;
+        
         LeaderboardEntry[] memory entries = new LeaderboardEntry[](count);
         
         for (uint256 i = 0; i < count; i++) {
-            entries[i] = leaderboard.entries[i + 1]; // ranks start at 1
+            entries[i] = leaderboardEntries[cycle][i + 1];
         }
         
         return entries;
     }
 
+    function getLeaderboardEntry(uint256 cycle, uint256 rank) external view returns (LeaderboardEntry memory) {
+        require(cycleData[cycle].finalized, "Leaderboard not finalized");
+        return leaderboardEntries[cycle][rank];
+    }
+
     function getEvermarkRank(uint256 cycle, uint256 evermarkId) external view returns (uint256) {
-        return cycleLeaderboards[cycle].evermarkRanks[evermarkId];
+        return evermarkRanks[cycle][evermarkId];
     }
 
     function getCycleStats(uint256 cycle) external view returns (
@@ -264,18 +278,23 @@ contract EvermarkLeaderboard is
         bool finalized,
         uint256 finalizedAt
     ) {
-        CycleLeaderboard storage leaderboard = cycleLeaderboards[cycle];
-        return (
-            leaderboard.totalParticipants,
-            leaderboard.totalVotes,
-            leaderboard.rewardPool,
-            leaderboard.finalized,
-            leaderboard.finalizedAt
-        );
+        CycleData memory data = cycleData[cycle];
+        return (data.totalParticipants, data.totalVotes, data.rewardPool, data.finalized, data.finalizedAt);
     }
 
     function isLeaderboardFinalized(uint256 cycle) external view returns (bool) {
-        return cycleLeaderboards[cycle].finalized;
+        return cycleData[cycle].finalized;
+    }
+
+    // Emergency functions
+    function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyRole(ADMIN_ROLE) {
+        emergencyPauseTimestamp = pauseUntilTimestamp;
+        emit EmergencyPauseSet(pauseUntilTimestamp);
+    }
+
+    function clearEmergencyPause() external onlyRole(ADMIN_ROLE) {
+        emergencyPauseTimestamp = 0;
+        emit EmergencyPauseSet(0);
     }
 
     // Admin functions
@@ -286,12 +305,12 @@ contract EvermarkLeaderboard is
     ) external onlyRole(ADMIN_ROLE) {
         require(_evermarkVoting != address(0), "Invalid voting address");
         require(_evermarkNFT != address(0), "Invalid NFT address");
-        require(_evermarkRewards != address(0), "Invalid rewards address");
         
         evermarkVoting = IEvermarkVoting(_evermarkVoting);
         evermarkNFT = IEvermarkNFT(_evermarkNFT);
-        evermarkRewards = IEvermarkRewards(_evermarkRewards);
-        
+        if (_evermarkRewards != address(0)) {
+            evermarkRewards = IEvermarkRewards(_evermarkRewards);
+        }
         emit LeaderboardConfigUpdated(_evermarkVoting, _evermarkNFT, _evermarkRewards);
     }
 
@@ -311,9 +330,83 @@ contract EvermarkLeaderboard is
         _unpause();
     }
 
-    // Emergency functions
+    // Emergency finalization
     function emergencyFinalizeLeaderboard(uint256 cycle) external onlyRole(ADMIN_ROLE) {
-        finalizeLeaderboard(cycle);
+        require(!cycleData[cycle].finalized, "Already finalized");
+        
+        cycleData[cycle] = CycleData({
+            cycle: cycle,
+            totalParticipants: 0,
+            totalVotes: 0,
+            rewardPool: 0,
+            finalized: true,
+            finalizedAt: block.timestamp
+        });
+        
+        emit LeaderboardFinalized(cycle, 0);
+    }
+
+    // Get top N entries with simple logic
+    function getTopEntries(uint256 cycle, uint256 count) external view returns (LeaderboardEntry[] memory) {
+        require(cycleData[cycle].finalized, "Leaderboard not finalized");
+        
+        uint256 maxCount = count > cycleData[cycle].totalParticipants ? cycleData[cycle].totalParticipants : count;
+        maxCount = maxCount > MAX_BATCH_SIZE ? MAX_BATCH_SIZE : maxCount;
+        
+        LeaderboardEntry[] memory entries = new LeaderboardEntry[](maxCount);
+        
+        for (uint256 i = 0; i < maxCount; i++) {
+            entries[i] = leaderboardEntries[cycle][i + 1];
+        }
+        
+        return entries;
+    }
+
+    // Simple paginated view
+    function getLeaderboardPage(uint256 cycle, uint256 page, uint256 pageSize) external view returns (
+        LeaderboardEntry[] memory entries,
+        uint256 totalPages,
+        uint256 totalEntries
+    ) {
+        require(cycleData[cycle].finalized, "Leaderboard not finalized");
+        require(pageSize <= MAX_BATCH_SIZE, "Page size too large");
+        require(page > 0, "Page must be > 0");
+        
+        totalEntries = cycleData[cycle].totalParticipants;
+        totalPages = (totalEntries + pageSize - 1) / pageSize; // Ceiling division
+        
+        if (page > totalPages) {
+            return (new LeaderboardEntry[](0), totalPages, totalEntries);
+        }
+        
+        uint256 startIndex = (page - 1) * pageSize + 1; // ranks start at 1
+        uint256 endIndex = startIndex + pageSize - 1;
+        if (endIndex > totalEntries) {
+            endIndex = totalEntries;
+        }
+        
+        uint256 resultSize = endIndex - startIndex + 1;
+        entries = new LeaderboardEntry[](resultSize);
+        
+        for (uint256 i = 0; i < resultSize; i++) {
+            entries[i] = leaderboardEntries[cycle][startIndex + i];
+        }
+    }
+
+    // Get reward info for a specific rank
+    function getRewardForRank(uint256 rank, uint256 totalParticipants, uint256 totalRewardPool) external pure returns (uint256) {
+        if (totalParticipants == 0 || totalRewardPool == 0) return 0;
+        
+        uint256 top10Reward = (totalRewardPool * 70) / 100;
+        uint256 otherReward = totalRewardPool - top10Reward;
+        
+        if (rank <= 10) {
+            uint256 top10Count = totalParticipants > 10 ? 10 : totalParticipants;
+            return top10Count > 0 ? top10Reward / top10Count : 0;
+        } else {
+            uint256 otherCount = totalParticipants > 10 ? totalParticipants - 10 : 0;
+            return otherCount > 0 ? otherReward / otherCount : 0;
+        }
     }
 
     // Required overrides
