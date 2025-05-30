@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
-import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
-import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts-upgradeable@4.8.0/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable@4.8.0/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable@4.8.0/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable@4.8.0/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable@4.8.0/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable@4.8.0/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts@4.8.0/token/ERC20/IERC20.sol";
 
 /*
  ██████╗ █████╗ ██████╗ ██████╗      ██████╗ █████╗ ████████╗ █████╗ ██╗      ██████╗  ██████╗ 
@@ -60,6 +60,8 @@ contract CardCatalog is
         string memory name,
         string memory symbol
     ) external initializer {
+        require(emarkTokenAddress != address(0), "Invalid token address");
+        
         __ERC20_init(name, symbol);
         __AccessControl_init();
         __Pausable_init();
@@ -83,7 +85,6 @@ contract CardCatalog is
         emit Wrapped(msg.sender, amount);
     }
 
-    // ✅ FIXED: Inline calculation instead of function call
     function requestUnwrap(uint256 amount) external whenNotPaused notInEmergency nonReentrant {
         require(amount > 0, "Amount must be > 0");
         require(balanceOf(msg.sender) >= amount, "Insufficient balance");
@@ -132,7 +133,6 @@ contract CardCatalog is
         emit VotingPowerDelegated(user, delegated);
     }
 
-    // ✅ FIXED: Changed to public so it can be called internally
     function getTotalVotingPower(address user) public view returns (uint256) {
         return balanceOf(user);
     }
@@ -175,14 +175,6 @@ contract CardCatalog is
         return emarkToken.balanceOf(address(this));
     }
 
-    function transfer(address, uint256) public pure override returns (bool) {
-        revert("Transfers disabled");
-    }
-
-    function transferFrom(address, address, uint256) public pure override returns (bool) {
-        revert("Transfers disabled");
-    }
-
     function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyRole(ADMIN_ROLE) {
         emergencyPauseTimestamp = pauseUntilTimestamp;
         emit EmergencyPauseSet(pauseUntilTimestamp);
@@ -223,5 +215,14 @@ contract CardCatalog is
 
     function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
         return super.supportsInterface(interfaceId);
+    }
+
+    // Override transfer functions to disable them (tokens should not be transferable)
+    function transfer(address, uint256) public pure override returns (bool) {
+        revert("Transfers disabled");
+    }
+
+    function transferFrom(address, address, uint256) public pure override returns (bool) {
+        revert("Transfers disabled");
     }
 }
