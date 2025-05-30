@@ -17,8 +17,8 @@ import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.
 */
 
 interface IEvermarkVoting {
-    function getTopBookmarksInCycle(uint256 cycle, uint256 limit) external view returns (
-        uint256[] memory bookmarkIds,
+    function getTopEvermarksInCycle(uint256 cycle, uint256 limit) external view returns (
+        uint256[] memory evermarkIds,
         uint256[] memory votes
     );
     function getCurrentCycle() external view returns (uint256);
@@ -28,7 +28,7 @@ interface IEvermarkVoting {
         uint256 totalVotes,
         uint256 totalDelegations,
         bool finalized,
-        uint256 activeBookmarksCount
+        uint256 activeEvermarksCount
     );
 }
 
@@ -135,8 +135,8 @@ contract EvermarkLeaderboard is
         require(votingFinalized, "Voting cycle not finalized");
         require(block.timestamp >= endTime, "Cycle not ended");
         
-        // Get top evermarks
-        (uint256[] memory evermarkIds, uint256[] memory votes) = evermarkVoting.getTopBookmarksInCycle(cycle, MAX_LEADERBOARD_SIZE);
+        // Get top evermarks - UPDATED: Using evermark method name
+        (uint256[] memory evermarkIds, uint256[] memory votes) = evermarkVoting.getTopEvermarksInCycle(cycle, MAX_LEADERBOARD_SIZE);
         
         // Store cycle data
         cycleData[cycle] = CycleData({

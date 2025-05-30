@@ -447,36 +447,6 @@ contract EvermarkVoting is
         }
     }
 
-    function getBookmarkVotes(uint256 bookmarkId) external view returns (uint256) {
-        return totalEvermarkVotes[bookmarkId];
-    }
-
-    function getBookmarkVotesInCycle(uint256 cycle, uint256 bookmarkId) external view returns (uint256) {
-        return votingCycles[cycle].evermarkVotes[bookmarkId];
-    }
-
-    function getUserVotesForBookmark(address user, uint256 bookmarkId) external view returns (uint256) {
-        return votingCycles[currentCycle].userEvermarkVotes[user][bookmarkId];
-    }
-
-    function getBookmarksWithVotesInCycle(uint256 cycle) external view returns (uint256[] memory) {
-        return votingCycles[cycle].activeEvermarks;
-    }
-
-    function getTopBookmarksInCycle(uint256 cycle, uint256 limit) external view returns (
-        uint256[] memory bookmarkIds,
-        uint256[] memory votes
-    ) {
-        return this.getTopEvermarksInCycle(cycle, limit);
-    }
-
-    function getTopBookmarksInCycleFallback(uint256 cycle, uint256 limit) external view returns (
-        uint256[] memory bookmarkIds,
-        uint256[] memory votes
-    ) {
-        return this.getTopEvermarksInCycleFallback(cycle, limit);
-    }
-
     function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyRole(ADMIN_ROLE) {
         emergencyPauseTimestamp = pauseUntilTimestamp;
         emit EmergencyPauseSet(pauseUntilTimestamp);
