@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts@4.8.0/access/Ownable.sol";
 
 /*
  ██████╗ █████╗ ██╗      ██████╗██╗   ██╗██╗      █████╗ ████████╗ ██████╗ ██████╗ 
@@ -49,8 +49,10 @@ contract RewardCalculatorHelper is Ownable {
     
     event RewardsCalculated(uint256 indexed week, uint256 userCount, uint256 totalDistributed);
     
-    constructor(address _cardCatalog) Ownable(msg.sender) {
+    constructor(address _cardCatalog) {
+        require(_cardCatalog != address(0), "Invalid CardCatalog address");
         cardCatalog = ICardCatalog(_cardCatalog);
+        _transferOwnership(msg.sender);
     }
     
     /**
@@ -60,7 +62,7 @@ contract RewardCalculatorHelper is Ownable {
      */
     function calculateBatchRewards(
         RewardCalculationInput calldata input
-    ) external view returns (UserRewardData[] memory rewards) {
+    ) external pure returns (UserRewardData[] memory rewards) {
         require(input.users.length == input.userStakes.length, "Array length mismatch");
         require(input.users.length == input.userDelegated.length, "Array length mismatch");
         require(input.totalStaked > 0, "Total staked cannot be zero");
@@ -187,22 +189,71 @@ contract RewardCalculatorHelper is Ownable {
         uint256 totalDistributed,
         uint256 userCount
     ) {
-        try this.calculateRewardsLive(0, totalRewardPool, users) returns (UserRewardData[] memory rewards) {
-            totalDistributed = 0;
-            userCount = 0;
-            
-            for (uint256 i = 0; i < rewards.length; i++) {
-                if (rewards[i].totalReward > 0) {
-                    totalDistributed += rewards[i].totalReward;
-                    userCount++;
-                }
-            }
-            
-            success = true;
+        uint256 userArrayLength = users.length;
+        if (userArrayLength == 0 || userArrayLength > 1000) {
+            return (false, 0, 0);
+        }
+        
+        // Get total staked from CardCatalog
+        uint256 totalStaked = cardCatalog.totalSupply();
+        if (totalStaked == 0) {
+            return (false, 0, 0);
+        }
+        
+        try this._simulateRewardCalculation(totalRewardPool, totalStaked, users) returns (
+            uint256 _totalDistributed,
+            uint256 _userCount
+        ) {
+            return (true, _totalDistributed, _userCount);
         } catch {
-            success = false;
-            totalDistributed = 0;
-            userCount = 0;
+            return (false, 0, 0);
+        }
+    }
+
+    /**
+     * @notice Internal simulation function that can be called with try/catch
+     * @param totalRewardPool Total reward pool
+     * @param totalStaked Total staked amount
+     * @param users Array of user addresses
+     * @return totalDistributed Total amount that would be distributed
+     * @return userCount Number of users that would receive rewards
+     */
+    function _simulateRewardCalculation(
+        uint256 totalRewardPool,
+        uint256 totalStaked,
+        address[] calldata users
+    ) external view returns (uint256 totalDistributed, uint256 userCount) {
+        // Prepare arrays for batch calculation
+        uint256[] memory userStakes = new uint256[](users.length);
+        uint256[] memory userDelegated = new uint256[](users.length);
+        
+        // Batch fetch user data
+        for (uint256 i = 0; i < users.length; i++) {
+            userStakes[i] = cardCatalog.balanceOf(users[i]);
+            userDelegated[i] = cardCatalog.getDelegatedVotingPower(users[i]);
+        }
+        
+        // Create input struct
+        RewardCalculationInput memory input = RewardCalculationInput({
+            totalRewardPool: totalRewardPool,
+            totalStaked: totalStaked,
+            users: users,
+            userStakes: userStakes,
+            userDelegated: userDelegated
+        });
+        
+        // Calculate rewards using pure function
+        UserRewardData[] memory rewards = this.calculateBatchRewards(input);
+        
+        // Calculate totals
+        totalDistributed = 0;
+        userCount = 0;
+        
+        for (uint256 i = 0; i < rewards.length; i++) {
+            if (rewards[i].totalReward > 0) {
+                totalDistributed += rewards[i].totalReward;
+                userCount++;
+            }
         }
     }
     
