@@ -17,31 +17,16 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  ╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝
 */
 
-interface ICardCatalog {
-    function balanceOf(address account) external view returns (uint256);
-    function totalSupply() external view returns (uint256);
-    function getAvailableVotingPower(address user) external view returns (uint256);
-    function getDelegatedVotingPower(address user) external view returns (uint256);
-}
-
-interface IEvermarkVoting {
-    function getCurrentCycle() external view returns (uint256);
-}
-
-interface IEvermarkLeaderboard {
-    function distributeCreatorRewards(uint256 cycle, uint256 rewardPool) external;
-    function isLeaderboardFinalized(uint256 cycle) external view returns (bool);
-}
-
-interface INFTStaking {
-    function getUserStakedNFTs(address user) external view returns (
-        uint256[] memory tokenIds,
-        uint256[] memory stakedTimes,
-        uint256[] memory lockPeriods,
-        uint256[] memory pendingRewards,
-        bool[] memory canUnstake
+interface IStakingDataProvider {
+    function getBatchStakingData(address[] calldata users) external view returns (
+        uint256[] memory balances,
+        uint256[] memory delegated,
+        uint256 totalSupply
     );
-    function distributeRewards(address[] calldata users, uint256[] calldata amounts) external;
+}
+
+interface IRewardDistributor {
+    function processCreatorRewards(uint256 week, uint256 amount) external;
 }
 
 contract EvermarkRewards is 
@@ -52,83 +37,65 @@ contract EvermarkRewards is
     ReentrancyGuardUpgradeable
 {
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant REWARDS_DISTRIBUTOR_ROLE = keccak256("REWARDS_DISTRIBUTOR_ROLE");
+    bytes32 public constant DISTRIBUTOR_ROLE = keccak256("DISTRIBUTOR_ROLE");
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    
+    uint256 private constant WEEK_DURATION = 7 days;
+    uint256 private constant BASIS_POINTS = 10000;
+    uint256 private constant TOKEN_STAKER_BPS = 6000;
+    uint256 private constant CREATOR_BPS = 4000;
+    uint256 private constant BASE_VARIABLE_SPLIT = 5000;
 
-    struct WeeklyRewardCycle {
-        uint256 week;
-        uint256 startTime;
-        uint256 endTime;
-        uint256 totalRewardPool;
-        uint256 tokenStakerPool;     // 60% of total
-        uint256 creatorPool;         // 40% of total
-        uint256 baseStakerPool;      // 50% of tokenStakerPool (30% of total)
-        uint256 variableStakerPool;  // 50% of tokenStakerPool (30% of total)
+    struct WeekData {
+        uint128 rewardPool;
+        uint128 creatorPool;
+        uint32 finalizedAt;
         bool finalized;
-        bool distributed;
-        mapping(address => uint256) userBaseRewards;
-        mapping(address => uint256) userVariableRewards;
-        mapping(address => uint256) userNftRewards;
-        mapping(address => bool) claimed;
+        bool merkleGenerated;
+    }
+    
+    struct StakingSnapshot {
+        uint256 totalStaked;
+        uint256 snapshotTime;
+        uint256 blockNumber;
+    }
+    
+    struct UserClaimData {
+        uint128 totalClaimed;
+        uint64 lastClaimWeek;
+        uint64 lastClaimTime;
     }
 
-    struct UserRewardSummary {
-        uint256 pendingBaseRewards;
-        uint256 pendingVariableRewards;
-        uint256 pendingNftRewards;
-        uint256 pendingCreatorRewards;
-        uint256 totalPending;
-        uint256 totalClaimed;
-    }
-
-    // Constants
-    uint256 public constant MAX_BATCH_SIZE = 100;
-    uint256 public constant WEEK_DURATION = 7 days;
-
-    // Storage
-    ICardCatalog public cardCatalog;
-    IEvermarkVoting public evermarkVoting;
-    IEvermarkLeaderboard public evermarkLeaderboard;
-    INFTStaking public nftStaking;
-    IERC20 public rewardToken; // EMARK token
+    IERC20 public rewardToken;
+    IStakingDataProvider public stakingProvider;
+    IRewardDistributor public rewardDistributor;
     
     uint256 public currentWeek;
-    uint256 public weekStartTime;
+    uint256 public protocolStartTime;
     
-    mapping(uint256 => WeeklyRewardCycle) public weeklyRewards;
-    mapping(address => uint256) public totalUserClaimed;
-    mapping(address => uint256) public pendingCreatorRewards;
-    
-    // Emergency circuit breaker
-    uint256 public emergencyPauseTimestamp;
-    
-    // Global tracking
-    uint256 public totalRewardsDistributed;
-    uint256 public totalTokenStakerRewards;
-    uint256 public totalCreatorRewards;
-    uint256 public totalNftStakerRewards;
-    
-    // Events
-    event WeeklyRewardsCalculated(
-        uint256 indexed week,
-        uint256 totalPool,
-        uint256 tokenStakerPool,
-        uint256 creatorPool
-    );
-    event RewardsClaimed(
-        address indexed user,
-        uint256 week,
-        uint256 baseRewards,
-        uint256 variableRewards,
-        uint256 nftRewards,
-        uint256 creatorRewards
-    );
-    event WeeklyRewardsDistributed(uint256 indexed week, uint256 totalDistributed);
-    event EmergencyPauseSet(uint256 timestamp);
-    event ContractsUpdated(address cardCatalog, address voting, address leaderboard, address nftStaking);
+    mapping(uint256 => WeekData) public weekData;
+    mapping(uint256 => bytes32) public weeklyMerkleRoots;
+    mapping(uint256 => mapping(uint256 => uint256)) public claimedBitmap;
+    mapping(address => uint256) public userIndex;
+    mapping(uint256 => address) public indexToUser;
+    uint256 public nextUserIndex;
+    mapping(address => UserClaimData) public userClaims;
+    mapping(uint256 => StakingSnapshot) public stakingSnapshots;
+    uint256 public emergencyPauseUntil;
 
-    modifier notInEmergency() {
-        require(block.timestamp > emergencyPauseTimestamp, "Emergency pause active");
+    event WeekFinalized(uint256 indexed week, uint256 rewardPool, uint256 creatorPool);
+    event MerkleRootSet(uint256 indexed week, bytes32 merkleRoot);
+    event RewardsClaimed(address indexed user, uint256 indexed week, uint256 amount);
+    event RewardsFunded(uint256 indexed week, uint256 amount);
+    event StakingSnapshotCached(uint256 indexed week, uint256 totalStaked);
+
+    modifier onlyWhenActive() {
+        require(block.timestamp > emergencyPauseUntil, "Emergency pause active");
+        _;
+    }
+    
+    modifier validWeek(uint256 week) {
+        require(week > 0 && week <= currentWeek, "Invalid week");
         _;
     }
 
@@ -137,11 +104,8 @@ contract EvermarkRewards is
     }
 
     function initialize(
-        address _cardCatalog,
-        address _evermarkVoting,
-        address _evermarkLeaderboard,
-        address _nftStaking,
-        address _rewardToken
+        address _rewardToken,
+        address _stakingProvider
     ) external initializer {
         __AccessControl_init();
         __Pausable_init();
@@ -150,432 +114,285 @@ contract EvermarkRewards is
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
-        _grantRole(REWARDS_DISTRIBUTOR_ROLE, msg.sender);
+        _grantRole(DISTRIBUTOR_ROLE, msg.sender);
         _grantRole(UPGRADER_ROLE, msg.sender);
 
-        cardCatalog = ICardCatalog(_cardCatalog);
-        evermarkVoting = IEvermarkVoting(_evermarkVoting);
-        if (_evermarkLeaderboard != address(0)) {
-            evermarkLeaderboard = IEvermarkLeaderboard(_evermarkLeaderboard);
-        }
-        nftStaking = INFTStaking(_nftStaking);
         rewardToken = IERC20(_rewardToken);
+        stakingProvider = IStakingDataProvider(_stakingProvider);
         
-        emergencyPauseTimestamp = 0;
-        
-        // Start first week
+        protocolStartTime = block.timestamp;
         currentWeek = 1;
-        weekStartTime = block.timestamp;
+        nextUserIndex = 1;
         
-        WeeklyRewardCycle storage week = weeklyRewards[currentWeek];
-        week.week = currentWeek;
-        week.startTime = block.timestamp;
-        week.endTime = block.timestamp + WEEK_DURATION;
+        emit WeekFinalized(1, 0, 0);
     }
 
-    // Fund the current week's reward pool
-    function fundWeeklyRewards(uint256 amount) external onlyRole(REWARDS_DISTRIBUTOR_ROLE) notInEmergency {
+    function fundWeeklyRewards(uint256 amount) external onlyRole(DISTRIBUTOR_ROLE) onlyWhenActive {
         require(amount > 0, "Amount must be > 0");
-        require(rewardToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
         
-        _checkAndStartNewWeek();
+        _autoAdvanceWeek();
         
-        WeeklyRewardCycle storage week = weeklyRewards[currentWeek];
-        week.totalRewardPool += amount;
+        rewardToken.transferFrom(msg.sender, address(this), amount);
         
-        // Split the pool: 60% token stakers, 40% creators
-        uint256 tokenStakerAllocation = (amount * 6000) / 10000; // 60%
-        uint256 creatorAllocation = amount - tokenStakerAllocation; // 40%
+        WeekData storage week = weekData[currentWeek];
+        uint256 creatorAmount = (amount * CREATOR_BPS) / BASIS_POINTS;
         
-        week.tokenStakerPool += tokenStakerAllocation;
-        week.creatorPool += creatorAllocation;
+        week.rewardPool += uint128(amount);
+        week.creatorPool += uint128(creatorAmount);
         
-        // Split token staker pool: 50% base, 50% variable
-        week.baseStakerPool += tokenStakerAllocation / 2;
-        week.variableStakerPool += tokenStakerAllocation / 2;
+        emit RewardsFunded(currentWeek, amount);
     }
-
-    // Finalize a completed week and calculate rewards
-    function finalizeWeek(uint256 week) external onlyRole(REWARDS_DISTRIBUTOR_ROLE) notInEmergency {
-        require(week < currentWeek, "Week not completed");
-        require(!weeklyRewards[week].finalized, "Week already finalized");
-        require(weeklyRewards[week].totalRewardPool > 0, "No rewards to distribute");
-        
-        WeeklyRewardCycle storage weekData = weeklyRewards[week];
-        weekData.finalized = true;
-        
-        // Distribute creator rewards via leaderboard if available
-        if (weekData.creatorPool > 0 && address(evermarkLeaderboard) != address(0)) {
-            try evermarkLeaderboard.distributeCreatorRewards(week, weekData.creatorPool) {
-                // Creator rewards distributed successfully
-            } catch {
-                // If leaderboard distribution fails, keep rewards for manual distribution
-            }
+    
+    function _autoAdvanceWeek() internal {
+        uint256 expectedWeek = _calculateCurrentWeek();
+        if (expectedWeek > currentWeek) {
+            currentWeek = expectedWeek;
+            emit WeekFinalized(currentWeek, 0, 0);
         }
-        
-        emit WeeklyRewardsCalculated(
-            week,
-            weekData.totalRewardPool,
-            weekData.tokenStakerPool,
-            weekData.creatorPool
-        );
+    }
+    
+    function _calculateCurrentWeek() internal view returns (uint256) {
+        return ((block.timestamp - protocolStartTime) / WEEK_DURATION) + 1;
     }
 
-    // Calculate rewards for a user in a specific week
-    function calculateUserWeeklyRewards(
-        address user,
-        uint256 week
-    ) external view returns (
-        uint256 baseRewards,
-        uint256 variableRewards,
-        uint256 nftRewards
-    ) {
-        WeeklyRewardCycle storage weekData = weeklyRewards[week];
-        if (!weekData.finalized) return (0, 0, 0);
-        
-        uint256 userStake = cardCatalog.balanceOf(user);
-        uint256 totalStaked = cardCatalog.totalSupply();
-        
-        // Division by zero protection
-        if (userStake == 0 || totalStaked == 0) return (0, 0, 0);
-        
-        // Base rewards: equal distribution based on stake
-        baseRewards = (weekData.baseStakerPool * userStake) / totalStaked;
-        
-        // Variable rewards: based on delegation percentage
-        uint256 userDelegated = cardCatalog.getDelegatedVotingPower(user);
-        uint256 delegationPercentage = userStake > 0 ? (userDelegated * 10000) / userStake : 0;
-        
-        uint256 userMaxVariable = (weekData.variableStakerPool * userStake) / totalStaked;
-        variableRewards = (userMaxVariable * delegationPercentage) / 10000;
-        
-        // NFT rewards: placeholder for now
-        nftRewards = 0;
-    }
-
-    // Batch calculate rewards with size limits and error handling
-    function batchCalculateRewards(
+    function finalizeWeek(
         uint256 week,
-        address[] calldata users
-    ) external onlyRole(REWARDS_DISTRIBUTOR_ROLE) {
-        require(users.length <= MAX_BATCH_SIZE, "Batch size too large");
-        require(weeklyRewards[week].finalized, "Week not finalized");
+        uint256 stakingSnapshot
+    ) external onlyRole(ADMIN_ROLE) validWeek(week) {
+        require(!weekData[week].finalized, "Week already finalized");
+        require(week < currentWeek, "Cannot finalize current week");
         
-        WeeklyRewardCycle storage weekData = weeklyRewards[week];
+        WeekData storage weekDataItem = weekData[week];
+        weekDataItem.finalized = true;
+        weekDataItem.finalizedAt = uint32(block.timestamp);
         
-        for (uint256 i = 0; i < users.length; i++) {
-            address user = users[i];
-            
-            try this.calculateUserWeeklyRewards(user, week) returns (
-                uint256 baseRewards, 
-                uint256 variableRewards, 
-                uint256 nftRewards
-            ) {
-                weekData.userBaseRewards[user] = baseRewards;
-                weekData.userVariableRewards[user] = variableRewards;
-                weekData.userNftRewards[user] = nftRewards;
-            } catch {
-                // Skip users with calculation errors
-                continue;
-            }
+        stakingSnapshots[week] = StakingSnapshot({
+            totalStaked: stakingSnapshot,
+            snapshotTime: block.timestamp,
+            blockNumber: block.number
+        });
+        
+        if (address(rewardDistributor) != address(0) && weekDataItem.creatorPool > 0) {
+            rewardDistributor.processCreatorRewards(week, weekDataItem.creatorPool);
         }
         
-        weekData.distributed = true;
+        emit WeekFinalized(week, weekDataItem.rewardPool, weekDataItem.creatorPool);
+        emit StakingSnapshotCached(week, stakingSnapshot);
     }
 
-    // Claim all pending rewards for a user
-    function claimAllRewards() external nonReentrant whenNotPaused notInEmergency returns (uint256 totalClaimed) {
-        address user = msg.sender;
+    function setWeeklyMerkleRoot(
+        uint256 week,
+        bytes32 merkleRoot
+    ) external onlyRole(ADMIN_ROLE) validWeek(week) {
+        require(weekData[week].finalized, "Week not finalized");
+        require(merkleRoot != bytes32(0), "Invalid merkle root");
         
-        // Calculate total pending rewards across all weeks
-        for (uint256 week = 1; week < currentWeek; week++) {
-            if (weeklyRewards[week].distributed && !weeklyRewards[week].claimed[user]) {
-                WeeklyRewardCycle storage weekData = weeklyRewards[week];
-                
-                uint256 baseRewards = weekData.userBaseRewards[user];
-                uint256 variableRewards = weekData.userVariableRewards[user];
-                uint256 nftRewards = weekData.userNftRewards[user];
-                uint256 creatorRewards = week == currentWeek - 1 ? pendingCreatorRewards[user] : 0; // Only latest week creator rewards
-                
-                uint256 weekTotal = baseRewards + variableRewards + nftRewards + creatorRewards;
-                
-                if (weekTotal > 0) {
-                    totalClaimed += weekTotal;
-                    weekData.claimed[user] = true;
-                    
-                    emit RewardsClaimed(
-                        user,
-                        week,
-                        baseRewards,
-                        variableRewards,
-                        nftRewards,
-                        creatorRewards
-                    );
-                }
-            }
-        }
+        weeklyMerkleRoots[week] = merkleRoot;
+        weekData[week].merkleGenerated = true;
         
-        // Reset creator rewards
-        pendingCreatorRewards[user] = 0;
-        
-        if (totalClaimed > 0) {
-            totalUserClaimed[user] += totalClaimed;
-            totalRewardsDistributed += totalClaimed;
-            
-            require(rewardToken.transfer(user, totalClaimed), "Reward transfer failed");
-        }
+        emit MerkleRootSet(week, merkleRoot);
     }
-
-    // Claim specific week with better error handling
-    function claimWeeklyRewards(uint256 week) external nonReentrant whenNotPaused notInEmergency returns (uint256 totalClaimed) {
-        address user = msg.sender;
-        require(weeklyRewards[week].distributed, "Week not distributed");
-        require(!weeklyRewards[week].claimed[user], "Already claimed");
+    
+    function batchClaimRewards(
+        uint256[] calldata weekNumbers,
+        uint256[] calldata amounts,
+        bytes32[][] calldata merkleProofs
+    ) external nonReentrant whenNotPaused onlyWhenActive {
+        uint256 length = weekNumbers.length;
+        require(length > 0 && length <= 50, "Invalid batch size");
+        require(length == amounts.length && length == merkleProofs.length, "Array length mismatch");
         
-        WeeklyRewardCycle storage weekData = weeklyRewards[week];
+        uint256 totalAmount = 0;
+        uint256 userIdx = _getUserIndex(msg.sender);
         
-        uint256 baseRewards = weekData.userBaseRewards[user];
-        uint256 variableRewards = weekData.userVariableRewards[user];
-        uint256 nftRewards = weekData.userNftRewards[user];
-        uint256 creatorRewards = week == currentWeek - 1 ? pendingCreatorRewards[user] : 0; // Only latest week creator rewards
-        
-        totalClaimed = baseRewards + variableRewards + nftRewards + creatorRewards;
-        
-        if (totalClaimed > 0) {
-            weekData.claimed[user] = true;
+        for (uint256 i = 0; i < length; i++) {
+            uint256 week = weekNumbers[i];
+            uint256 amount = amounts[i];
             
-            if (creatorRewards > 0) {
-                pendingCreatorRewards[user] = 0;
-            }
+            require(week > 0 && week < currentWeek, "Invalid week");
+            require(amount > 0, "Invalid amount");
+            require(weeklyMerkleRoots[week] != bytes32(0), "Merkle root not set");
             
-            totalUserClaimed[user] += totalClaimed;
-            totalRewardsDistributed += totalClaimed;
+            require(!_isRewardClaimed(week, userIdx), "Already claimed");
             
-            require(rewardToken.transfer(user, totalClaimed), "Reward transfer failed");
-            
-            emit RewardsClaimed(
-                user,
-                week,
-                baseRewards,
-                variableRewards,
-                nftRewards,
-                creatorRewards
+            require(
+                _verifyMerkleProof(merkleProofs[i], weeklyMerkleRoots[week], msg.sender, amount),
+                "Invalid merkle proof"
             );
+            
+            _setRewardClaimed(week, userIdx);
+            totalAmount += amount;
+            
+            emit RewardsClaimed(msg.sender, week, amount);
+        }
+        
+        if (totalAmount > 0) {
+            UserClaimData storage userData = userClaims[msg.sender];
+            userData.totalClaimed += uint128(totalAmount);
+            userData.lastClaimWeek = uint64(weekNumbers[length - 1]);
+            userData.lastClaimTime = uint64(block.timestamp);
+            
+            rewardToken.transfer(msg.sender, totalAmount);
         }
     }
-
-    // Get comprehensive reward summary for a user
-    function getUserRewardSummary(address user) external view returns (UserRewardSummary memory summary) {
-        for (uint256 week = 1; week < currentWeek; week++) {
-            if (weeklyRewards[week].distributed && !weeklyRewards[week].claimed[user]) {
-                WeeklyRewardCycle storage weekData = weeklyRewards[week];
-                
-                summary.pendingBaseRewards += weekData.userBaseRewards[user];
-                summary.pendingVariableRewards += weekData.userVariableRewards[user];
-                summary.pendingNftRewards += weekData.userNftRewards[user];
+    
+    function _getUserIndex(address user) internal returns (uint256) {
+        uint256 idx = userIndex[user];
+        if (idx == 0) {
+            idx = nextUserIndex++;
+            userIndex[user] = idx;
+            indexToUser[idx] = user;
+        }
+        return idx;
+    }
+    
+    function _isRewardClaimed(uint256 week, uint256 userIdx) internal view returns (bool) {
+        uint256 wordIndex = userIdx / 256;
+        uint256 bitIndex = userIdx % 256;
+        return (claimedBitmap[week][wordIndex] >> bitIndex) & 1 == 1;
+    }
+    
+    function _setRewardClaimed(uint256 week, uint256 userIdx) internal {
+        uint256 wordIndex = userIdx / 256;
+        uint256 bitIndex = userIdx % 256;
+        claimedBitmap[week][wordIndex] |= (1 << bitIndex);
+    }
+    
+    function _verifyMerkleProof(
+        bytes32[] memory proof,
+        bytes32 root,
+        address user,
+        uint256 amount
+    ) internal pure returns (bool) {
+        bytes32 leaf = keccak256(abi.encodePacked(user, amount));
+        bytes32 computedHash = leaf;
+        
+        for (uint256 i = 0; i < proof.length; i++) {
+            bytes32 proofElement = proof[i];
+            if (computedHash <= proofElement) {
+                computedHash = keccak256(abi.encodePacked(computedHash, proofElement));
+            } else {
+                computedHash = keccak256(abi.encodePacked(proofElement, computedHash));
             }
         }
         
-        summary.pendingCreatorRewards = pendingCreatorRewards[user];
-        summary.totalPending = summary.pendingBaseRewards + 
-                              summary.pendingVariableRewards + 
-                              summary.pendingNftRewards + 
-                              summary.pendingCreatorRewards;
-        summary.totalClaimed = totalUserClaimed[user];
+        return computedHash == root;
     }
 
-    // Check and start new week if needed
-    function _checkAndStartNewWeek() internal {
-        if (block.timestamp >= weeklyRewards[currentWeek].endTime) {
-            _startNewWeek();
-        }
-    }
-
-    // Start a new reward week
-    function _startNewWeek() internal {
-        currentWeek++;
-        weekStartTime = block.timestamp;
-        
-        WeeklyRewardCycle storage newWeek = weeklyRewards[currentWeek];
-        newWeek.week = currentWeek;
-        newWeek.startTime = block.timestamp;
-        newWeek.endTime = block.timestamp + WEEK_DURATION;
-    }
-
-    // Force start new week (admin only)
-    function forceStartNewWeek() external onlyRole(ADMIN_ROLE) {
-        _startNewWeek();
-    }
-
-    // Get current week info
     function getCurrentWeekInfo() external view returns (
         uint256 week,
-        uint256 startTime,
-        uint256 endTime,
-        uint256 totalPool,
         uint256 timeRemaining,
+        uint256 rewardPool,
         bool finalized
     ) {
-        WeeklyRewardCycle storage weekData = weeklyRewards[currentWeek];
-        week = currentWeek;
-        startTime = weekData.startTime;
-        endTime = weekData.endTime;
-        totalPool = weekData.totalRewardPool;
-        timeRemaining = block.timestamp >= endTime ? 0 : endTime - block.timestamp;
-        finalized = weekData.finalized;
+        week = _calculateCurrentWeek();
+        uint256 weekStart = protocolStartTime + (week - 1) * WEEK_DURATION;
+        uint256 weekEnd = weekStart + WEEK_DURATION;
+        timeRemaining = block.timestamp >= weekEnd ? 0 : weekEnd - block.timestamp;
+        
+        WeekData memory weekDataItem = weekData[week];
+        rewardPool = weekDataItem.rewardPool;
+        finalized = weekDataItem.finalized;
     }
-
-    // Get week info for any week
-    function getWeekInfo(uint256 weekNumber) external view returns (
-        uint256 week,
-        uint256 startTime,
-        uint256 endTime,
-        uint256 totalPool,
-        uint256 tokenStakerPool,
-        uint256 creatorPool,
-        bool finalized,
-        bool distributed
+    
+    function getUserClaimSummary(address user) external view returns (
+        uint256 totalClaimed,
+        uint256 lastClaimWeek,
+        uint256 lastClaimTime,
+        uint256 userIdx
     ) {
-        WeeklyRewardCycle storage weekData = weeklyRewards[weekNumber];
+        UserClaimData memory userData = userClaims[user];
         return (
-            weekData.week,
-            weekData.startTime,
-            weekData.endTime,
-            weekData.totalRewardPool,
-            weekData.tokenStakerPool,
-            weekData.creatorPool,
-            weekData.finalized,
-            weekData.distributed
+            userData.totalClaimed,
+            userData.lastClaimWeek,
+            userData.lastClaimTime,
+            userIndex[user]
+        );
+    }
+    
+    function checkClaimedStatus(
+        address user,
+        uint256[] calldata weekNumbers
+    ) external view returns (bool[] memory claimed) {
+        uint256 userIdx = userIndex[user];
+        claimed = new bool[](weekNumbers.length);
+        
+        if (userIdx == 0) {
+            return claimed;
+        }
+        
+        for (uint256 i = 0; i < weekNumbers.length; i++) {
+            claimed[i] = _isRewardClaimed(weekNumbers[i], userIdx);
+        }
+    }
+    
+    function getWeekData(uint256 week) external view validWeek(week) returns (
+        uint256 rewardPool,
+        uint256 creatorPool,
+        uint256 finalizedAt,
+        bool finalized,
+        bool merkleGenerated,
+        bytes32 merkleRoot
+    ) {
+        WeekData memory weekDataItem = weekData[week];
+        return (
+            weekDataItem.rewardPool,
+            weekDataItem.creatorPool,
+            weekDataItem.finalizedAt,
+            weekDataItem.finalized,
+            weekDataItem.merkleGenerated,
+            weeklyMerkleRoots[week]
         );
     }
 
-    // Distribute creator rewards (called by leaderboard)
-    function distributeCreatorRewards(
-        address[] calldata creators,
-        uint256[] calldata amounts
-    ) external onlyRole(REWARDS_DISTRIBUTOR_ROLE) {
-        require(creators.length == amounts.length, "Array length mismatch");
-        require(creators.length <= MAX_BATCH_SIZE, "Batch size too large");
-        
-        for (uint256 i = 0; i < creators.length; i++) {
-            if (amounts[i] > 0) {
-                pendingCreatorRewards[creators[i]] += amounts[i];
-                totalCreatorRewards += amounts[i];
-            }
-        }
+    function setEmergencyPause(uint256 pauseUntil) external onlyRole(ADMIN_ROLE) {
+        emergencyPauseUntil = pauseUntil;
     }
-
-    // Protocol fee distribution (new function)
-    function distributeProtocolFees(uint256 amount) external onlyRole(REWARDS_DISTRIBUTOR_ROLE) {
-        require(amount > 0, "Amount must be > 0");
-        
-        // Add to current week's pool
-        _checkAndStartNewWeek();
-        
-        WeeklyRewardCycle storage week = weeklyRewards[currentWeek];
-        week.totalRewardPool += amount;
-        
-        // Split the pool: 60% token stakers, 40% creators
-        uint256 tokenStakerAllocation = (amount * 6000) / 10000; // 60%
-        uint256 creatorAllocation = amount - tokenStakerAllocation; // 40%
-        
-        week.tokenStakerPool += tokenStakerAllocation;
-        week.creatorPool += creatorAllocation;
-        
-        // Split token staker pool: 50% base, 50% variable
-        week.baseStakerPool += tokenStakerAllocation / 2;
-        week.variableStakerPool += tokenStakerAllocation / 2;
+    
+    function setStakingProvider(address _stakingProvider) external onlyRole(ADMIN_ROLE) {
+        require(_stakingProvider != address(0), "Invalid address");
+        stakingProvider = IStakingDataProvider(_stakingProvider);
     }
-
-    // Emergency functions
-    function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyRole(ADMIN_ROLE) {
-        emergencyPauseTimestamp = pauseUntilTimestamp;
-        emit EmergencyPauseSet(pauseUntilTimestamp);
+    
+    function setRewardDistributor(address _rewardDistributor) external onlyRole(ADMIN_ROLE) {
+        rewardDistributor = IRewardDistributor(_rewardDistributor);
     }
-
-    function clearEmergencyPause() external onlyRole(ADMIN_ROLE) {
-        emergencyPauseTimestamp = 0;
-        emit EmergencyPauseSet(0);
-    }
-
-    // Admin functions
-    function updateContracts(
-        address _cardCatalog,
-        address _evermarkVoting,
-        address _evermarkLeaderboard,
-        address _nftStaking
+    
+    function emergencyWithdraw(
+        address token,
+        uint256 amount,
+        address recipient
     ) external onlyRole(ADMIN_ROLE) {
-        require(_cardCatalog != address(0), "Invalid card catalog");
-        require(_evermarkVoting != address(0), "Invalid voting");
-        require(_nftStaking != address(0), "Invalid NFT staking");
-        
-        cardCatalog = ICardCatalog(_cardCatalog);
-        evermarkVoting = IEvermarkVoting(_evermarkVoting);
-        if (_evermarkLeaderboard != address(0)) {
-            evermarkLeaderboard = IEvermarkLeaderboard(_evermarkLeaderboard);
-        }
-        nftStaking = INFTStaking(_nftStaking);
-        
-        emit ContractsUpdated(_cardCatalog, _evermarkVoting, _evermarkLeaderboard, _nftStaking);
+        require(recipient != address(0), "Invalid recipient");
+        IERC20(token).transfer(recipient, amount);
     }
-
-    function setRewardToken(address _rewardToken) external onlyRole(ADMIN_ROLE) {
-        require(_rewardToken != address(0), "Invalid token address");
-        rewardToken = IERC20(_rewardToken);
-    }
-
+    
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
     }
-
+    
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
 
-    // Emergency functions
-    function emergencyWithdraw(uint256 amount, address recipient) external onlyRole(ADMIN_ROLE) {
-        require(recipient != address(0), "Invalid recipient");
-        require(amount <= rewardToken.balanceOf(address(this)), "Insufficient balance");
-        
-        rewardToken.transfer(recipient, amount);
-    }
-
-    // Get user rewards for specific week
-    function getUserWeekRewards(address user, uint256 week) external view returns (
-        uint256 baseRewards,
-        uint256 variableRewards,
-        uint256 nftRewards,
-        bool claimed
+    function calculateRewardSplit(uint256 totalPool) external pure returns (
+        uint256 tokenStakerPool,
+        uint256 creatorPool,
+        uint256 basePool,
+        uint256 variablePool
     ) {
-        WeeklyRewardCycle storage weekData = weeklyRewards[week];
-        return (
-            weekData.userBaseRewards[user],
-            weekData.userVariableRewards[user],
-            weekData.userNftRewards[user],
-            weekData.claimed[user]
-        );
+        tokenStakerPool = (totalPool * TOKEN_STAKER_BPS) / BASIS_POINTS;
+        creatorPool = totalPool - tokenStakerPool;
+        basePool = (tokenStakerPool * BASE_VARIABLE_SPLIT) / BASIS_POINTS;
+        variablePool = tokenStakerPool - basePool;
+    }
+    
+    function version() external pure returns (string memory) {
+        return "2.0.0";
     }
 
-    // Get global stats
-    function getGlobalStats() external view returns (
-        uint256 totalDistributed,
-        uint256 totalTokenStaker,
-        uint256 totalCreator,
-        uint256 totalNftStaker,
-        uint256 currentWeekNumber
-    ) {
-        return (
-            totalRewardsDistributed,
-            totalTokenStakerRewards,
-            totalCreatorRewards,
-            totalNftStakerRewards,
-            currentWeek
-        );
-    }
-
-    // Required overrides
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
-
+    
     function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
         return super.supportsInterface(interfaceId);
     }
