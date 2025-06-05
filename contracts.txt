@@ -1,23 +1,83 @@
-# 🚀 Complete Evermark System - Integration Guide
+# 🚀 Core Evermark Ecosystem - Launch Ready
 
-## 📋 **Full Feature Set Delivered**
+## 📋 **Essential Contracts for Launch**
 
-### **Core Features**
-✅ **Evermark NFT Minting** with referral system  
-✅ **EMARK Token Staking** with voting power  
-✅ **NFT Staking** with lock periods and vote-based rewards  
-✅ **Weekly Reward Distribution** (60% stakers, 40% creators)  
-✅ **Delegation-based Variable Rewards** (50% base + 50% variable)  
-✅ **Creator Leaderboard** with automated rewards  
-✅ **NFT Auctions** with fee distribution  
-✅ **Comprehensive Fee Collection** and routing  
+### **Phase 1: Core Functionality (Deploy Today)**
 
-## 🏗 **System Architecture**
+#### **1. EvermarkNFT.sol** ✅ READY
+- **Purpose**: Core NFT minting with referral system
+- **Key Features**: 
+  - Mint Evermarks with metadata
+  - 10% referral rewards
+  - Batch minting support
+- **Dependencies**: FeeCollector (for fee routing)
+
+#### **2. CardCatalog.sol** ✅ READY  
+- **Purpose**: EMARK token staking → wEMARK (voting power)
+- **Key Features**:
+  - Wrap/unwrap EMARK with 7-day unbonding
+  - Track voting power delegation
+  - Emergency pause functionality
+- **Dependencies**: EMARK token
+
+#### **3. EvermarkVoting.sol** ✅ READY
+- **Purpose**: Vote delegation and cycle management
+- **Key Features**:
+  - 7-day voting cycles
+  - Delegate voting power to Evermarks
+  - Leaderboard data generation
+- **Dependencies**: CardCatalog, EvermarkNFT
+
+#### **4. EvermarkLeaderboard.sol** ✅ READY
+- **Purpose**: Creator rewards based on vote rankings
+- **Key Features**:
+  - Finalize weekly leaderboards
+  - Distribute creator rewards (70% to top 10, 30% to others)
+- **Dependencies**: EvermarkVoting, EvermarkNFT, EvermarkRewards
+
+#### **5. EvermarkRewards.sol** ✅ READY
+- **Purpose**: Periodic reward distribution to stakers
+- **Key Features**:
+  - Adaptive rates based on pool balances
+  - Dual-token rewards (ETH + EMARK)
+  - Automatic rebalancing periods
+- **Dependencies**: CardCatalog
+
+#### **6. FeeCollector.sol** ✅ READY
+- **Purpose**: Collect and route fees from all sources
+- **Key Features**:
+  - Route ETH/EMARK fees to Treasury/Dev/Rewards
+  - Automatic distribution
+  - Multiple fee source support
+- **Dependencies**: EvermarkRewards
+
+---
+
+## 🗑️ **Contracts to REMOVE for Launch**
+
+### **❌ EvermarkRewardHelper.sol** 
+- **Why Remove**: Optimization contract for off-chain calculations
+- **Impact**: None - EvermarkRewards handles core functionality
+- **Note**: Can be added later for gas optimization
+
+### **❌ NFTStaking.sol**
+- **Why Remove**: Adds complexity with NFT staking rewards
+- **Impact**: Simpler initial user experience
+- **Note**: Can be added in Phase 2 as additional utility
+
+### **❌ EvermarkAuction.sol** (mentioned in contracts.txt but missing)
+- **Why Remove**: Secondary marketplace feature
+- **Impact**: Focus on core minting/voting first
+- **Note**: Can be built separately later
+
+---
+
+## 🏗️ **Simplified Architecture**
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   EvermarkNFT   │───▶│  FeeCollector    │───▶│ EvermarkRewards │
-│  (w/ Referrals) │    │  (Fee Router)    │    │ (Coordinator)   │
+│  (NFT + Refs)   │    │  (Fee Router)    │    │ (Staker Rewards)│
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │                       │
          ▼                       ▼                       ▼
@@ -25,229 +85,136 @@
 │ EvermarkVoting  │    │   CardCatalog    │    │ EvermarkLeader- │
 │ (Vote Tracking) │    │ (EMARK Staking)  │    │ board (Creator  │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   NFTStaking    │    │ EvermarkAuction  │    │   Frontend UI   │
-│ (NFT Rewards)   │    │ (Marketplace)    │    │               │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
 ```
 
-## 💰 **Reward Flow (Weekly Cycle)**
+---
 
-### **Week N: Collection Phase**
-1. **Trading fees** → FeeCollector
-2. **NFT creation fees** → FeeCollector  
-3. **Auction fees** → FeeCollector
-4. **Manual funding** → EvermarkRewards
+## 💰 **Simplified Reward Flow**
 
-### **Week N+1: Distribution Phase**
+### **Weekly Cycle (Much Simpler)**
 ```
-Total Weekly Pool (100%)
-├── 60% → EMARK Token Stakers
-│   ├── 30% → Base Rewards (equal distribution)
-│   └── 30% → Variable Rewards (delegation-based)
-└── 40% → Creator Rewards (leaderboard-based)
+Total Pool (100%)
+├── 60% → EMARK Stakers (via EvermarkRewards)
+│   └── Distributed based on staking amount
+└── 40% → Creators (via EvermarkLeaderboard)
+    ├── 70% → Top 10 Evermarks
+    └── 30% → Remaining ranked Evermarks
 ```
 
-### **Example: Alice stakes 100 EMARK, delegates 75**
-- **Base Rewards**: Full share of 30% pool based on her 100 EMARK stake
-- **Variable Rewards**: 75% of her potential share from 30% pool (because she delegated 75%)
-- **Total**: Base + (0.75 × Variable)
+### **Fee Sources → Pool**
+- NFT creation fees (0.0007 ETH per mint)
+- Manual funding
+- Future trading fees
 
-## 🔄 **Weekly Operations Workflow**
+---
 
-### **Monday: New Week Starts**
-```solidity
-// 1. Fund the week's rewards
-evermarkRewards.fundWeeklyRewards(1000000 * 1e18); // 1M EMARK
+## 🚀 **Launch Day Deployment Order**
 
-// 2. Auto-start new week (happens automatically when funded)
-```
-
-### **Sunday: Week Ends**
-```solidity
-// 1. Finalize voting cycle
-evermarkVoting.startNewVotingCycle();
-
-// 2. Finalize leaderboard
-evermarkLeaderboard.finalizeLeaderboard(weekNumber);
-
-// 3. Calculate and distribute rewards
-evermarkRewards.finalizeWeek(weekNumber);
-
-// 4. Batch calculate user rewards
-address[] memory users = getAllStakers(); // You'll implement this
-evermarkRewards.batchCalculateRewards(weekNumber, users);
-```
-
-## 📱 **Frontend Integration Points**
-
-### **User Dashboard Components**
-
-#### **1. Staking Overview**
-```typescript
-// Get user's staking summary
-const stakingSummary = useReadContract({
-  contract: cardCatalogContract,
-  method: "getUserStakingSummary",
-  params: [userAddress],
-});
-
-// Get user's delegation status
-const { totalStaked, availablePower, delegatedPower } = stakingSummary;
-const delegationPercentage = totalStaked > 0 ? (delegatedPower / totalStaked) * 100 : 0;
-```
-
-#### **2. Rewards Summary**
-```typescript
-// Get complete reward breakdown
-const rewardSummary = useReadContract({
-  contract: evermarkRewardsContract,
-  method: "getUserRewardSummary", 
-  params: [userAddress],
-});
-
-const {
-  pendingBaseRewards,
-  pendingVariableRewards,
-  pendingNftRewards,
-  pendingCreatorRewards,
-  totalPending,
-  totalClaimed
-} = rewardSummary;
-```
-
-#### **3. NFT Staking Dashboard**
-```typescript
-// Get user's staked NFTs
-const stakedNFTs = useReadContract({
-  contract: nftStakingContract,
-  method: "getUserStakedNFTs",
-  params: [userAddress],
-});
-
-// Display lock periods, rewards, unstake availability
-const { tokenIds, lockPeriods, pendingRewards, canUnstake } = stakedNFTs;
-```
-
-#### **4. Weekly Leaderboard**
-```typescript
-// Get current week leaderboard
-const leaderboard = useReadContract({
-  contract: leaderboardContract,
-  method: "getLeaderboard",
-  params: [currentWeek, 50], // Top 50
-});
-
-// Show ranks, votes, estimated rewards
-```
-
-## 🎯 **Key User Actions**
-
-### **Staking & Voting Flow**
-1. **Stake EMARK** → Get voting power
-2. **Delegate votes** → Earn variable rewards
-3. **Stake NFTs** → Earn vote-based rewards  
-4. **Claim rewards** → Receive EMARK tokens
-
-### **Creation & Referral Flow**
-1. **Mint with referral** → Referrer gets 10% fee
-2. **Share referral link** → Earn from others' mints
-3. **Create popular content** → Earn creator rewards
-
-## ⚙️ **Deployment Checklist**
-
-### **1. Deploy Contracts (In Order)**
+### **1. Deploy Core Contracts**
 ```bash
-# 1. Token
+# 1. Prerequisite: Deploy EMARK token first
 deploy EMARK_TOKEN
 
 # 2. Core staking
 deploy CardCatalog(EMARK_TOKEN)
 
-# 3. Fee management  
-deploy FeeCollector(treasury, dev)
+# 3. Fee management
+deploy FeeCollector()
 
-# 4. Central coordinator
-deploy EvermarkRewards(CardCatalog, EvermarkVoting, EvermarkLeaderboard, NFTStaking, EMARK_TOKEN)
+# 4. Rewards coordinator  
+deploy EvermarkRewards(EMARK_TOKEN, CardCatalog)
 
 # 5. NFT system
-deploy EvermarkNFT(FeeCollector)
+deploy EvermarkNFT()
 deploy EvermarkVoting(CardCatalog, EvermarkNFT)
 
-# 6. Specialized features
-deploy NFTStaking(EvermarkNFT, EvermarkVoting, EvermarkNFT, EMARK_TOKEN)
+# 6. Creator rewards
 deploy EvermarkLeaderboard(EvermarkVoting, EvermarkNFT, EvermarkRewards)
-deploy EvermarkAuction(EvermarkRewards, FeeCollector)
 ```
 
-### **2. Configure References**
+### **2. Configure Connections**
 ```solidity
-// Set all contract references
-evermarkRewards.updateContracts(cardCatalog, voting, leaderboard, nftStaking);
+// Set fee collector destination
 feeCollector.setEvermarkRewards(evermarkRewards);
-nftStaking.setContracts(voting, nftInterface);
+evermarkNFT.setFeeCollector(feeCollector);
 
-// Grant roles
-evermarkRewards.grantRole(REWARDS_DISTRIBUTOR_ROLE, deployer);
-leaderboard.grantRole(LEADERBOARD_MANAGER_ROLE, deployer);
-nftStaking.grantRole(REWARDS_MANAGER_ROLE, evermarkRewards);
+// Grant necessary roles
+evermarkRewards.grantRole(DISTRIBUTOR_ROLE, deployer);
+evermarkLeaderboard.grantRole(LEADERBOARD_MANAGER_ROLE, deployer);
+
+// Set up fee routing (Treasury 30%, Dev 10%, Rewards 60%)
+feeCollector.bootstrapStandardConfig(
+    emarkToken,
+    evermarkRewards, 
+    treasuryWallet,
+    devWallet
+);
 ```
 
-### **3. Initial Setup**
+### **3. Initial Funding**
 ```solidity
-// Fund initial rewards
-EMARK_TOKEN.transfer(evermarkRewards, 10000000 * 1e18); // 10M EMARK
+// Fund initial rewards pool
+emarkToken.transfer(evermarkRewards, 1000000 * 1e18); // 1M EMARK
 
-// Start first week
-evermarkRewards.fundWeeklyRewards(1000000 * 1e18); // 1M for week 1
+// Fund with ETH for immediate rewards
+evermarkRewards.fundEthRewards{value: 10 ether}();
 ```
 
-## 🧪 **Testing Strategy**
+---
 
-### **Phase 1: Basic Functionality**
-- Mint NFTs with and without referrals
-- Stake EMARK tokens and delegate votes
-- Stake NFTs with different lock periods
+## 📱 **Core User Actions (Day 1)**
 
-### **Phase 2: Reward Mechanics**
-- Complete a full weekly cycle
-- Test reward calculations (base + variable)
-- Verify creator reward distribution
+### **For Users:**
+1. **Stake EMARK** → Earn rewards + get voting power
+2. **Mint Evermarks** → Pay fees (fund reward pool)
+3. **Vote on Evermarks** → Influence creator rewards
+4. **Claim Rewards** → Receive ETH + EMARK
 
-### **Phase 3: Integration Testing**
-- Test all contract interactions
-- Verify fee flows and distributions
-- Test emergency functions
+### **For Creators:**
+1. **Mint Evermarks** (with referral links)
+2. **Get votes** → Earn creator rewards
+3. **Refer new users** → Earn 10% referral fees
 
-## 📊 **Monitoring & Analytics**
+---
 
-### **Key Metrics to Track**
-- Weekly reward pool size
-- Staker participation rates
-- Delegation percentages  
-- NFT staking adoption
-- Creator reward distribution
-- Fee collection amounts
+## 🎯 **Success Metrics (Week 1)**
 
-### **Events to Index**
-- `WeeklyRewardsCalculated`
-- `RewardsClaimed`
-- `VoteDelegated`
-- `NFTStaked`
-- `EvermarkMinted`
-- `ReferralEarned`
+- ✅ Users can mint NFTs
+- ✅ Users can stake EMARK
+- ✅ Users can vote on Evermarks  
+- ✅ Weekly rewards distribute properly
+- ✅ Creator leaderboard functions
+- ✅ Fees flow to reward pools
 
-## 🎉 **Result: Complete DeFi Ecosystem**
+---
 
-This integration delivers a **complete DeFi ecosystem** with:
+## 🔮 **Phase 2 Features (Later)**
 
-- **Sustainable tokenomics** (weekly reward cycles)
-- **Multiple revenue streams** (creation fees, auction fees, trading fees)
-- **Incentivized participation** (staking rewards, creator rewards)
-- **Viral growth mechanics** (referral system)
-- **Community governance** (voting system)
-- **NFT utility** (staking for rewards)
+- **NFT Staking**: Stake NFTs for additional rewards
+- **Advanced Rewards**: Base/variable split based on delegation %
+- **Marketplace**: Secondary trading with fees
+- **Governance**: Protocol parameter voting
+- **Liquid Staking**: Transferable staking derivatives
 
-**You now have a full-featured platform ready to deploy and scale!** 🚀
+---
+
+## 💡 **Key Simplifications Made**
+
+1. **Removed complex reward calculations** → Simple proportional staking rewards
+2. **Removed NFT staking** → Focus on EMARK staking only
+3. **Removed helper contracts** → Direct reward distribution
+4. **Simplified fee routing** → Standard 3-way split
+5. **Removed auction system** → Focus on primary minting
+
+---
+
+## ✅ **Ready to Deploy**
+
+This streamlined system gives you:
+- **Core NFT platform** with referrals
+- **Staking rewards** for EMARK holders
+- **Creator incentives** via voting
+- **Sustainable tokenomics** via fees
+- **All essential functionality** for launch
+
+**Total: 6 contracts, clear dependencies, ready to go! 🚀**
