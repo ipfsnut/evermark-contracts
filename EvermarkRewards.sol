@@ -7,6 +7,8 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /*
  ██████╗ ███████╗██╗    ██╗ █████╗ ██████╗ ██████╗ ███████╗
@@ -17,18 +19,16 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  ╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝
 */
 
-interface IStakingDataProvider {
-    function getBatchStakingData(address[] calldata users) external view returns (
-        uint256[] memory balances,
-        uint256[] memory delegated,
-        uint256 totalSupply
-    );
+interface ICardCatalog {
+    function balanceOf(address account) external view returns (uint256);
+    function totalSupply() external view returns (uint256);
 }
 
-interface IRewardDistributor {
-    function processCreatorRewards(uint256 week, uint256 amount) external;
-}
-
+/**
+ * @title EvermarkRewards
+ * @notice Periodic adaptive dual-token rewards with stable periods
+ * @dev Combines pool-percentage distribution with Synthetix-style stable periods
+ */
 contract EvermarkRewards is 
     Initializable,
     AccessControlUpgradeable,
@@ -36,77 +36,83 @@ contract EvermarkRewards is
     UUPSUpgradeable,
     ReentrancyGuardUpgradeable
 {
+    using SafeERC20 for IERC20;
+
+    /* ========== ROLES ========== */
+
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant DISTRIBUTOR_ROLE = keccak256("DISTRIBUTOR_ROLE");
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
-    
-    uint256 private constant WEEK_DURATION = 7 days;
-    uint256 private constant BASIS_POINTS = 10000;
-    uint256 private constant TOKEN_STAKER_BPS = 6000;
-    uint256 private constant CREATOR_BPS = 4000;
-    uint256 private constant BASE_VARIABLE_SPLIT = 5000;
 
-    struct WeekData {
-        uint128 rewardPool;
-        uint128 creatorPool;
-        uint32 finalizedAt;
-        bool finalized;
-        bool merkleGenerated;
-    }
-    
-    struct StakingSnapshot {
-        uint256 totalStaked;
-        uint256 snapshotTime;
-        uint256 blockNumber;
-    }
-    
-    struct UserClaimData {
-        uint128 totalClaimed;
-        uint64 lastClaimWeek;
-        uint64 lastClaimTime;
-    }
+    /* ========== STATE VARIABLES ========== */
 
-    IERC20 public rewardToken;
-    IStakingDataProvider public stakingProvider;
-    IRewardDistributor public rewardDistributor;
+    IERC20 public emarkToken;         
+    ICardCatalog public stakingToken; 
     
-    uint256 public currentWeek;
-    uint256 public protocolStartTime;
+    // Adaptive configuration
+    uint256 public ethDistributionRate;    // Annual % in basis points (e.g., 1000 = 10%)
+    uint256 public emarkDistributionRate;  
+    uint256 public rebalancePeriod;        // How often to update rates (e.g., 7 days)
     
-    mapping(uint256 => WeekData) public weekData;
-    mapping(uint256 => bytes32) public weeklyMerkleRoots;
-    mapping(uint256 => mapping(uint256 => uint256)) public claimedBitmap;
-    mapping(address => uint256) public userIndex;
-    mapping(uint256 => address) public indexToUser;
-    uint256 public nextUserIndex;
-    mapping(address => UserClaimData) public userClaims;
-    mapping(uint256 => StakingSnapshot) public stakingSnapshots;
+    // Current period tracking
+    uint256 public currentPeriodStart;
+    uint256 public currentPeriodEnd;
+    uint256 public ethRewardRate;          // Fixed rate for current period
+    uint256 public emarkRewardRate;        // Fixed rate for current period
+    
+    // Synthetix-style reward tracking
+    uint256 public ethLastUpdateTime;
+    uint256 public emarkLastUpdateTime;
+    uint256 public ethRewardPerTokenStored;
+    uint256 public emarkRewardPerTokenStored;
+    uint256 public ethTotalDistributed;
+    uint256 public emarkTotalDistributed;
+    
+    // User reward tracking
+    mapping(address => uint256) public userEthRewardPerTokenPaid;
+    mapping(address => uint256) public userEmarkRewardPerTokenPaid;
+    mapping(address => uint256) public ethRewards_user;
+    mapping(address => uint256) public emarkRewards_user;
+
+    // Pool snapshots for period calculation
+    uint256 public lastEthPoolSnapshot;
+    uint256 public lastEmarkPoolSnapshot;
+
     uint256 public emergencyPauseUntil;
 
-    event WeekFinalized(uint256 indexed week, uint256 rewardPool, uint256 creatorPool);
-    event MerkleRootSet(uint256 indexed week, bytes32 merkleRoot);
-    event RewardsClaimed(address indexed user, uint256 indexed week, uint256 amount);
-    event RewardsFunded(uint256 indexed week, uint256 amount);
-    event StakingSnapshotCached(uint256 indexed week, uint256 totalStaked);
+    /* ========== EVENTS ========== */
 
-    modifier onlyWhenActive() {
-        require(block.timestamp > emergencyPauseUntil, "Emergency pause active");
-        _;
-    }
-    
-    modifier validWeek(uint256 week) {
-        require(week > 0 && week <= currentWeek, "Invalid week");
-        _;
-    }
+    event PeriodRebalanced(
+        uint256 indexed periodStart,
+        uint256 indexed periodEnd,
+        uint256 ethPoolSnapshot,
+        uint256 emarkPoolSnapshot,
+        uint256 newEthRate,
+        uint256 newEmarkRate
+    );
+    event DistributionRateUpdated(string tokenType, uint256 newRate);
+    event EthRewardPaid(address indexed user, uint256 reward);
+    event EmarkRewardPaid(address indexed user, uint256 reward);
+    event EthPoolFunded(uint256 amount, address indexed from);
+    event EmarkPoolFunded(uint256 amount, address indexed from);
 
     constructor() {
         _disableInitializers();
     }
 
     function initialize(
-        address _rewardToken,
-        address _stakingProvider
+        address _emarkToken,           
+        address _stakingToken,         
+        uint256 _ethDistributionRate,  // Annual % in basis points (e.g., 1000 = 10%)
+        uint256 _emarkDistributionRate,
+        uint256 _rebalancePeriod       // Seconds between rebalances (e.g., 7 days)
     ) external initializer {
+        require(_emarkToken != address(0), "Invalid EMARK token");
+        require(_stakingToken != address(0), "Invalid staking token");
+        require(_ethDistributionRate <= 50000, "ETH rate too high");
+        require(_emarkDistributionRate <= 50000, "EMARK rate too high");
+        require(_rebalancePeriod >= 1 hours, "Rebalance period too short");
+
         __AccessControl_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
@@ -117,282 +123,292 @@ contract EvermarkRewards is
         _grantRole(DISTRIBUTOR_ROLE, msg.sender);
         _grantRole(UPGRADER_ROLE, msg.sender);
 
-        rewardToken = IERC20(_rewardToken);
-        stakingProvider = IStakingDataProvider(_stakingProvider);
+        emarkToken = IERC20(_emarkToken);
+        stakingToken = ICardCatalog(_stakingToken);
+        ethDistributionRate = _ethDistributionRate;
+        emarkDistributionRate = _emarkDistributionRate;
+        rebalancePeriod = _rebalancePeriod;
         
-        protocolStartTime = block.timestamp;
-        currentWeek = 1;
-        nextUserIndex = 1;
-        
-        emit WeekFinalized(1, 0, 0);
+        // Initialize first period
+        _initializePeriod();
     }
 
-    function fundWeeklyRewards(uint256 amount) external onlyRole(DISTRIBUTOR_ROLE) onlyWhenActive {
+    /* ========== MODIFIERS ========== */
+
+    modifier updateReward(address account) {
+        _checkAndRebalance(); // Auto-rebalance if period ended
+        _updateEthRewards(account);
+        _updateEmarkRewards(account);
+        _;
+    }
+
+    modifier onlyWhenActive() {
+        require(block.timestamp > emergencyPauseUntil, "Emergency pause active");
+        _;
+    }
+
+    /* ========== PERIOD MANAGEMENT ========== */
+
+    function _initializePeriod() internal {
+        currentPeriodStart = block.timestamp;
+        currentPeriodEnd = block.timestamp + rebalancePeriod;
+        ethLastUpdateTime = block.timestamp;
+        emarkLastUpdateTime = block.timestamp;
+        
+        // Set initial rates based on current pool balances
+        _calculateNewRates();
+    }
+
+    function _checkAndRebalance() internal {
+        if (block.timestamp >= currentPeriodEnd) {
+            _performRebalance();
+        }
+    }
+
+    function _performRebalance() internal {
+        // Update rewards before changing rates
+        _updateEthRewards(address(0));
+        _updateEmarkRewards(address(0));
+        
+        // Take pool snapshots
+        lastEthPoolSnapshot = address(this).balance;
+        lastEmarkPoolSnapshot = emarkToken.balanceOf(address(this));
+        
+        // Calculate new rates based on current pool balances
+        _calculateNewRates();
+        
+        // Start new period
+        currentPeriodStart = block.timestamp;
+        currentPeriodEnd = block.timestamp + rebalancePeriod;
+        
+        emit PeriodRebalanced(
+            currentPeriodStart,
+            currentPeriodEnd,
+            lastEthPoolSnapshot,
+            lastEmarkPoolSnapshot,
+            ethRewardRate,
+            emarkRewardRate
+        );
+    }
+
+    function _calculateNewRates() internal {
+        uint256 ethPool = address(this).balance;
+        uint256 emarkPool = emarkToken.balanceOf(address(this));
+        
+        // Calculate rates: (pool * percentage) / rebalancePeriod
+        if (ethPool > 0) {
+            uint256 ethForPeriod = (ethPool * ethDistributionRate * rebalancePeriod) / (10000 * 365 days);
+            ethRewardRate = ethForPeriod / rebalancePeriod; // Per second for this period
+        } else {
+            ethRewardRate = 0;
+        }
+        
+        if (emarkPool > 0) {
+            uint256 emarkForPeriod = (emarkPool * emarkDistributionRate * rebalancePeriod) / (10000 * 365 days);
+            emarkRewardRate = emarkForPeriod / rebalancePeriod; // Per second for this period
+        } else {
+            emarkRewardRate = 0;
+        }
+    }
+
+    /* ========== REWARD CALCULATIONS ========== */
+
+    function _updateEthRewards(address account) internal {
+        ethRewardPerTokenStored = ethRewardPerToken();
+        ethLastUpdateTime = lastTimeRewardApplicable();
+        if (account != address(0)) {
+            ethRewards_user[account] = ethEarned(account);
+            userEthRewardPerTokenPaid[account] = ethRewardPerTokenStored;
+        }
+    }
+
+    function _updateEmarkRewards(address account) internal {
+        emarkRewardPerTokenStored = emarkRewardPerToken();
+        emarkLastUpdateTime = lastTimeRewardApplicable();
+        if (account != address(0)) {
+            emarkRewards_user[account] = emarkEarned(account);
+            userEmarkRewardPerTokenPaid[account] = emarkRewardPerTokenStored;
+        }
+    }
+
+    function lastTimeRewardApplicable() public view returns (uint256) {
+        return Math.min(block.timestamp, currentPeriodEnd);
+    }
+
+    function ethRewardPerToken() public view returns (uint256) {
+        uint256 totalStaked = stakingToken.totalSupply();
+        if (totalStaked == 0) {
+            return ethRewardPerTokenStored;
+        }
+        
+        uint256 timeElapsed = lastTimeRewardApplicable() - ethLastUpdateTime;
+        return ethRewardPerTokenStored + ((timeElapsed * ethRewardRate * 1e18) / totalStaked);
+    }
+
+    function emarkRewardPerToken() public view returns (uint256) {
+        uint256 totalStaked = stakingToken.totalSupply();
+        if (totalStaked == 0) {
+            return emarkRewardPerTokenStored;
+        }
+        
+        uint256 timeElapsed = lastTimeRewardApplicable() - emarkLastUpdateTime;
+        return emarkRewardPerTokenStored + ((timeElapsed * emarkRewardRate * 1e18) / totalStaked);
+    }
+
+    function ethEarned(address account) public view returns (uint256) {
+        uint256 balance = stakingToken.balanceOf(account);
+        return ((balance * (ethRewardPerToken() - userEthRewardPerTokenPaid[account])) / 1e18) + ethRewards_user[account];
+    }
+
+    function emarkEarned(address account) public view returns (uint256) {
+        uint256 balance = stakingToken.balanceOf(account);
+        return ((balance * (emarkRewardPerToken() - userEmarkRewardPerTokenPaid[account])) / 1e18) + emarkRewards_user[account];
+    }
+
+    /* ========== VIEWS ========== */
+
+    function totalSupply() external view returns (uint256) {
+        return stakingToken.totalSupply();
+    }
+
+    function balanceOf(address account) external view returns (uint256) {
+        return stakingToken.balanceOf(account);
+    }
+
+    /**
+     * @notice Get current period and pool status
+     */
+    function getPeriodStatus() external view returns (
+        uint256 periodStart,
+        uint256 periodEnd,
+        uint256 timeUntilRebalance,
+        uint256 currentEthPool,
+        uint256 currentEmarkPool,
+        uint256 currentEthRate,
+        uint256 currentEmarkRate,
+        uint256 nextEthRate,
+        uint256 nextEmarkRate
+    ) {
+        periodStart = currentPeriodStart;
+        periodEnd = currentPeriodEnd;
+        timeUntilRebalance = block.timestamp >= currentPeriodEnd ? 0 : currentPeriodEnd - block.timestamp;
+        
+        currentEthPool = address(this).balance;
+        currentEmarkPool = emarkToken.balanceOf(address(this));
+        currentEthRate = ethRewardRate;
+        currentEmarkRate = emarkRewardRate;
+        
+        // Calculate what rates would be if rebalanced now
+        if (currentEthPool > 0) {
+            uint256 ethForPeriod = (currentEthPool * ethDistributionRate * rebalancePeriod) / (10000 * 365 days);
+            nextEthRate = ethForPeriod / rebalancePeriod;
+        }
+        if (currentEmarkPool > 0) {
+            uint256 emarkForPeriod = (currentEmarkPool * emarkDistributionRate * rebalancePeriod) / (10000 * 365 days);
+            nextEmarkRate = emarkForPeriod / rebalancePeriod;
+        }
+    }
+
+    function getUserRewardInfo(address user) external view returns (
+        uint256 pendingEth,
+        uint256 pendingEmark,
+        uint256 stakedAmount,
+        uint256 periodEthRewards,
+        uint256 periodEmarkRewards
+    ) {
+        pendingEth = ethEarned(user);
+        pendingEmark = emarkEarned(user);
+        stakedAmount = stakingToken.balanceOf(user);
+        
+        uint256 totalStaked = stakingToken.totalSupply();
+        if (stakedAmount > 0 && totalStaked > 0) {
+            uint256 remainingTime = block.timestamp >= currentPeriodEnd ? 0 : currentPeriodEnd - block.timestamp;
+            periodEthRewards = (ethRewardRate * remainingTime * stakedAmount) / totalStaked;
+            periodEmarkRewards = (emarkRewardRate * remainingTime * stakedAmount) / totalStaked;
+        }
+    }
+
+    /* ========== MUTATIVE FUNCTIONS ========== */
+
+    function claimRewards() external nonReentrant whenNotPaused onlyWhenActive updateReward(msg.sender) {
+        uint256 ethReward = ethRewards_user[msg.sender];
+        uint256 emarkReward = emarkRewards_user[msg.sender];
+        
+        require(ethReward > 0 || emarkReward > 0, "No rewards to claim");
+        
+        if (ethReward > 0) {
+            ethRewards_user[msg.sender] = 0;
+            ethTotalDistributed += ethReward;
+            
+            (bool success, ) = payable(msg.sender).call{value: ethReward}("");
+            require(success, "ETH transfer failed");
+            
+            emit EthRewardPaid(msg.sender, ethReward);
+        }
+        
+        if (emarkReward > 0) {
+            emarkRewards_user[msg.sender] = 0;
+            emarkTotalDistributed += emarkReward;
+            
+            emarkToken.safeTransfer(msg.sender, emarkReward);
+            
+            emit EmarkRewardPaid(msg.sender, emarkReward);
+        }
+    }
+
+    /* ========== FUNDING FUNCTIONS ========== */
+
+    function fundEthRewards() external payable onlyRole(DISTRIBUTOR_ROLE) onlyWhenActive {
+        require(msg.value > 0, "Must send ETH");
+        emit EthPoolFunded(msg.value, msg.sender);
+        // Rates will be updated at next rebalance
+    }
+
+    function fundRewards(uint256 amount) external onlyRole(DISTRIBUTOR_ROLE) onlyWhenActive {
         require(amount > 0, "Amount must be > 0");
-        
-        _autoAdvanceWeek();
-        
-        rewardToken.transferFrom(msg.sender, address(this), amount);
-        
-        WeekData storage week = weekData[currentWeek];
-        uint256 creatorAmount = (amount * CREATOR_BPS) / BASIS_POINTS;
-        
-        week.rewardPool += uint128(amount);
-        week.creatorPool += uint128(creatorAmount);
-        
-        emit RewardsFunded(currentWeek, amount);
-    }
-    
-    function _autoAdvanceWeek() internal {
-        uint256 expectedWeek = _calculateCurrentWeek();
-        if (expectedWeek > currentWeek) {
-            currentWeek = expectedWeek;
-            emit WeekFinalized(currentWeek, 0, 0);
-        }
-    }
-    
-    function _calculateCurrentWeek() internal view returns (uint256) {
-        return ((block.timestamp - protocolStartTime) / WEEK_DURATION) + 1;
+        emarkToken.safeTransferFrom(msg.sender, address(this), amount);
+        emit EmarkPoolFunded(amount, msg.sender);
+        // Rates will be updated at next rebalance
     }
 
-    function finalizeWeek(
-        uint256 week,
-        uint256 stakingSnapshot
-    ) external onlyRole(ADMIN_ROLE) validWeek(week) {
-        require(!weekData[week].finalized, "Week already finalized");
-        require(week < currentWeek, "Cannot finalize current week");
-        
-        WeekData storage weekDataItem = weekData[week];
-        weekDataItem.finalized = true;
-        weekDataItem.finalizedAt = uint32(block.timestamp);
-        
-        stakingSnapshots[week] = StakingSnapshot({
-            totalStaked: stakingSnapshot,
-            snapshotTime: block.timestamp,
-            blockNumber: block.number
-        });
-        
-        if (address(rewardDistributor) != address(0) && weekDataItem.creatorPool > 0) {
-            rewardDistributor.processCreatorRewards(week, weekDataItem.creatorPool);
-        }
-        
-        emit WeekFinalized(week, weekDataItem.rewardPool, weekDataItem.creatorPool);
-        emit StakingSnapshotCached(week, stakingSnapshot);
+    /* ========== ADMIN FUNCTIONS ========== */
+
+    function setEthDistributionRate(uint256 _rate) external onlyRole(ADMIN_ROLE) {
+        require(_rate <= 50000, "Rate too high");
+        ethDistributionRate = _rate;
+        emit DistributionRateUpdated("ETH", _rate);
     }
 
-    function setWeeklyMerkleRoot(
-        uint256 week,
-        bytes32 merkleRoot
-    ) external onlyRole(ADMIN_ROLE) validWeek(week) {
-        require(weekData[week].finalized, "Week not finalized");
-        require(merkleRoot != bytes32(0), "Invalid merkle root");
-        
-        weeklyMerkleRoots[week] = merkleRoot;
-        weekData[week].merkleGenerated = true;
-        
-        emit MerkleRootSet(week, merkleRoot);
-    }
-    
-    function batchClaimRewards(
-        uint256[] calldata weekNumbers,
-        uint256[] calldata amounts,
-        bytes32[][] calldata merkleProofs
-    ) external nonReentrant whenNotPaused onlyWhenActive {
-        uint256 length = weekNumbers.length;
-        require(length > 0 && length <= 50, "Invalid batch size");
-        require(length == amounts.length && length == merkleProofs.length, "Array length mismatch");
-        
-        uint256 totalAmount = 0;
-        uint256 userIdx = _getUserIndex(msg.sender);
-        
-        for (uint256 i = 0; i < length; i++) {
-            uint256 week = weekNumbers[i];
-            uint256 amount = amounts[i];
-            
-            require(week > 0 && week < currentWeek, "Invalid week");
-            require(amount > 0, "Invalid amount");
-            require(weeklyMerkleRoots[week] != bytes32(0), "Merkle root not set");
-            
-            require(!_isRewardClaimed(week, userIdx), "Already claimed");
-            
-            require(
-                _verifyMerkleProof(merkleProofs[i], weeklyMerkleRoots[week], msg.sender, amount),
-                "Invalid merkle proof"
-            );
-            
-            _setRewardClaimed(week, userIdx);
-            totalAmount += amount;
-            
-            emit RewardsClaimed(msg.sender, week, amount);
-        }
-        
-        if (totalAmount > 0) {
-            UserClaimData storage userData = userClaims[msg.sender];
-            userData.totalClaimed += uint128(totalAmount);
-            userData.lastClaimWeek = uint64(weekNumbers[length - 1]);
-            userData.lastClaimTime = uint64(block.timestamp);
-            
-            rewardToken.transfer(msg.sender, totalAmount);
-        }
-    }
-    
-    function _getUserIndex(address user) internal returns (uint256) {
-        uint256 idx = userIndex[user];
-        if (idx == 0) {
-            idx = nextUserIndex++;
-            userIndex[user] = idx;
-            indexToUser[idx] = user;
-        }
-        return idx;
-    }
-    
-    function _isRewardClaimed(uint256 week, uint256 userIdx) internal view returns (bool) {
-        uint256 wordIndex = userIdx / 256;
-        uint256 bitIndex = userIdx % 256;
-        return (claimedBitmap[week][wordIndex] >> bitIndex) & 1 == 1;
-    }
-    
-    function _setRewardClaimed(uint256 week, uint256 userIdx) internal {
-        uint256 wordIndex = userIdx / 256;
-        uint256 bitIndex = userIdx % 256;
-        claimedBitmap[week][wordIndex] |= (1 << bitIndex);
-    }
-    
-    function _verifyMerkleProof(
-        bytes32[] memory proof,
-        bytes32 root,
-        address user,
-        uint256 amount
-    ) internal pure returns (bool) {
-        bytes32 leaf = keccak256(abi.encodePacked(user, amount));
-        bytes32 computedHash = leaf;
-        
-        for (uint256 i = 0; i < proof.length; i++) {
-            bytes32 proofElement = proof[i];
-            if (computedHash <= proofElement) {
-                computedHash = keccak256(abi.encodePacked(computedHash, proofElement));
-            } else {
-                computedHash = keccak256(abi.encodePacked(proofElement, computedHash));
-            }
-        }
-        
-        return computedHash == root;
+    function setEmarkDistributionRate(uint256 _rate) external onlyRole(ADMIN_ROLE) {
+        require(_rate <= 50000, "Rate too high");
+        emarkDistributionRate = _rate;
+        emit DistributionRateUpdated("EMARK", _rate);
     }
 
-    function getCurrentWeekInfo() external view returns (
-        uint256 week,
-        uint256 timeRemaining,
-        uint256 rewardPool,
-        bool finalized
-    ) {
-        week = _calculateCurrentWeek();
-        uint256 weekStart = protocolStartTime + (week - 1) * WEEK_DURATION;
-        uint256 weekEnd = weekStart + WEEK_DURATION;
-        timeRemaining = block.timestamp >= weekEnd ? 0 : weekEnd - block.timestamp;
-        
-        WeekData memory weekDataItem = weekData[week];
-        rewardPool = weekDataItem.rewardPool;
-        finalized = weekDataItem.finalized;
-    }
-    
-    function getUserClaimSummary(address user) external view returns (
-        uint256 totalClaimed,
-        uint256 lastClaimWeek,
-        uint256 lastClaimTime,
-        uint256 userIdx
-    ) {
-        UserClaimData memory userData = userClaims[user];
-        return (
-            userData.totalClaimed,
-            userData.lastClaimWeek,
-            userData.lastClaimTime,
-            userIndex[user]
-        );
-    }
-    
-    function checkClaimedStatus(
-        address user,
-        uint256[] calldata weekNumbers
-    ) external view returns (bool[] memory claimed) {
-        uint256 userIdx = userIndex[user];
-        claimed = new bool[](weekNumbers.length);
-        
-        if (userIdx == 0) {
-            return claimed;
-        }
-        
-        for (uint256 i = 0; i < weekNumbers.length; i++) {
-            claimed[i] = _isRewardClaimed(weekNumbers[i], userIdx);
-        }
-    }
-    
-    function getWeekData(uint256 week) external view validWeek(week) returns (
-        uint256 rewardPool,
-        uint256 creatorPool,
-        uint256 finalizedAt,
-        bool finalized,
-        bool merkleGenerated,
-        bytes32 merkleRoot
-    ) {
-        WeekData memory weekDataItem = weekData[week];
-        return (
-            weekDataItem.rewardPool,
-            weekDataItem.creatorPool,
-            weekDataItem.finalizedAt,
-            weekDataItem.finalized,
-            weekDataItem.merkleGenerated,
-            weeklyMerkleRoots[week]
-        );
+    function setRebalancePeriod(uint256 _period) external onlyRole(ADMIN_ROLE) {
+        require(_period >= 1 hours, "Period too short");
+        rebalancePeriod = _period;
     }
 
-    function setEmergencyPause(uint256 pauseUntil) external onlyRole(ADMIN_ROLE) {
-        emergencyPauseUntil = pauseUntil;
+    /**
+     * @notice Manually trigger rebalance (if needed)
+     */
+    function manualRebalance() external onlyRole(ADMIN_ROLE) {
+        _performRebalance();
     }
-    
-    function setStakingProvider(address _stakingProvider) external onlyRole(ADMIN_ROLE) {
-        require(_stakingProvider != address(0), "Invalid address");
-        stakingProvider = IStakingDataProvider(_stakingProvider);
-    }
-    
-    function setRewardDistributor(address _rewardDistributor) external onlyRole(ADMIN_ROLE) {
-        rewardDistributor = IRewardDistributor(_rewardDistributor);
-    }
-    
-    function emergencyWithdraw(
-        address token,
-        uint256 amount,
-        address recipient
-    ) external onlyRole(ADMIN_ROLE) {
-        require(recipient != address(0), "Invalid recipient");
-        IERC20(token).transfer(recipient, amount);
-    }
-    
+
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
     }
-    
+
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
 
-    function calculateRewardSplit(uint256 totalPool) external pure returns (
-        uint256 tokenStakerPool,
-        uint256 creatorPool,
-        uint256 basePool,
-        uint256 variablePool
-    ) {
-        tokenStakerPool = (totalPool * TOKEN_STAKER_BPS) / BASIS_POINTS;
-        creatorPool = totalPool - tokenStakerPool;
-        basePool = (tokenStakerPool * BASE_VARIABLE_SPLIT) / BASIS_POINTS;
-        variablePool = tokenStakerPool - basePool;
-    }
-    
-    function version() external pure returns (string memory) {
-        return "2.0.0";
-    }
+    receive() external payable {}
 
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
-    
+
     function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
         return super.supportsInterface(interfaceId);
     }
