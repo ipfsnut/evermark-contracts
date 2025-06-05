@@ -47,17 +47,18 @@ contract EvermarkRewards is
     /* ========== STATE VARIABLES ========== */
 
     IERC20 public emarkToken;         
+    IERC20 public wethToken;          // CHANGED: Added WETH token
     ICardCatalog public stakingToken; 
     
     // Adaptive configuration
-    uint256 public ethDistributionRate;    // Annual % in basis points (e.g., 1000 = 10%)
+    uint256 public ethDistributionRate;    // Annual % in basis points for WETH (e.g., 1000 = 10%)
     uint256 public emarkDistributionRate;  
     uint256 public rebalancePeriod;        // How often to update rates (e.g., 7 days)
     
     // Current period tracking
     uint256 public currentPeriodStart;
     uint256 public currentPeriodEnd;
-    uint256 public ethRewardRate;          // Fixed rate for current period
+    uint256 public ethRewardRate;          // Fixed WETH rate for current period
     uint256 public emarkRewardRate;        // Fixed rate for current period
     
     // Synthetix-style reward tracking
@@ -65,17 +66,17 @@ contract EvermarkRewards is
     uint256 public emarkLastUpdateTime;
     uint256 public ethRewardPerTokenStored;
     uint256 public emarkRewardPerTokenStored;
-    uint256 public ethTotalDistributed;
+    uint256 public ethTotalDistributed;    // Total WETH distributed
     uint256 public emarkTotalDistributed;
     
     // User reward tracking
     mapping(address => uint256) public userEthRewardPerTokenPaid;
     mapping(address => uint256) public userEmarkRewardPerTokenPaid;
-    mapping(address => uint256) public ethRewards_user;
+    mapping(address => uint256) public ethRewards_user;    // WETH rewards for users
     mapping(address => uint256) public emarkRewards_user;
 
     // Pool snapshots for period calculation
-    uint256 public lastEthPoolSnapshot;
+    uint256 public lastEthPoolSnapshot;    // Last WETH pool snapshot
     uint256 public lastEmarkPoolSnapshot;
 
     uint256 public emergencyPauseUntil;
@@ -85,15 +86,15 @@ contract EvermarkRewards is
     event PeriodRebalanced(
         uint256 indexed periodStart,
         uint256 indexed periodEnd,
-        uint256 ethPoolSnapshot,
+        uint256 ethPoolSnapshot,    // WETH pool snapshot
         uint256 emarkPoolSnapshot,
-        uint256 newEthRate,
+        uint256 newEthRate,         // WETH rate
         uint256 newEmarkRate
     );
     event DistributionRateUpdated(string tokenType, uint256 newRate);
-    event EthRewardPaid(address indexed user, uint256 reward);
+    event EthRewardPaid(address indexed user, uint256 reward);        // WETH rewards paid
     event EmarkRewardPaid(address indexed user, uint256 reward);
-    event EthPoolFunded(uint256 amount, address indexed from);
+    event EthPoolFunded(uint256 amount, address indexed from);        // WETH pool funded
     event EmarkPoolFunded(uint256 amount, address indexed from);
 
     constructor() {
@@ -102,14 +103,16 @@ contract EvermarkRewards is
 
     function initialize(
         address _emarkToken,           
-        address _stakingToken,         
-        uint256 _ethDistributionRate,  // Annual % in basis points (e.g., 1000 = 10%)
+        address _stakingToken,
+        address _wethToken,            // NEW: WETH token address
+        uint256 _wethDistributionRate, // Annual % in basis points for WETH
         uint256 _emarkDistributionRate,
         uint256 _rebalancePeriod       // Seconds between rebalances (e.g., 7 days)
     ) external initializer {
         require(_emarkToken != address(0), "Invalid EMARK token");
         require(_stakingToken != address(0), "Invalid staking token");
-        require(_ethDistributionRate <= 50000, "ETH rate too high");
+        require(_wethToken != address(0), "Invalid WETH token");     // NEW
+        require(_wethDistributionRate <= 50000, "WETH rate too high");
         require(_emarkDistributionRate <= 50000, "EMARK rate too high");
         require(_rebalancePeriod >= 1 hours, "Rebalance period too short");
 
@@ -124,8 +127,9 @@ contract EvermarkRewards is
         _grantRole(UPGRADER_ROLE, msg.sender);
 
         emarkToken = IERC20(_emarkToken);
+        wethToken = IERC20(_wethToken);                              // NEW
         stakingToken = ICardCatalog(_stakingToken);
-        ethDistributionRate = _ethDistributionRate;
+        ethDistributionRate = _wethDistributionRate;
         emarkDistributionRate = _emarkDistributionRate;
         rebalancePeriod = _rebalancePeriod;
         
@@ -171,7 +175,7 @@ contract EvermarkRewards is
         _updateEmarkRewards(address(0));
         
         // Take pool snapshots
-        lastEthPoolSnapshot = address(this).balance;
+        lastEthPoolSnapshot = wethToken.balanceOf(address(this));    // WETH pool snapshot
         lastEmarkPoolSnapshot = emarkToken.balanceOf(address(this));
         
         // Calculate new rates based on current pool balances
@@ -192,13 +196,13 @@ contract EvermarkRewards is
     }
 
     function _calculateNewRates() internal {
-        uint256 ethPool = address(this).balance;
+        uint256 wethPool = wethToken.balanceOf(address(this));       // WETH pool balance
         uint256 emarkPool = emarkToken.balanceOf(address(this));
         
         // Calculate rates: (pool * percentage) / rebalancePeriod
-        if (ethPool > 0) {
-            uint256 ethForPeriod = (ethPool * ethDistributionRate * rebalancePeriod) / (10000 * 365 days);
-            ethRewardRate = ethForPeriod / rebalancePeriod; // Per second for this period
+        if (wethPool > 0) {
+            uint256 wethForPeriod = (wethPool * ethDistributionRate * rebalancePeriod) / (10000 * 365 days);
+            ethRewardRate = wethForPeriod / rebalancePeriod; // Per second for this period
         } else {
             ethRewardRate = 0;
         }
@@ -293,7 +297,7 @@ contract EvermarkRewards is
         periodEnd = currentPeriodEnd;
         timeUntilRebalance = block.timestamp >= currentPeriodEnd ? 0 : currentPeriodEnd - block.timestamp;
         
-        currentEthPool = address(this).balance;
+        currentEthPool = wethToken.balanceOf(address(this));         // WETH pool balance
         currentEmarkPool = emarkToken.balanceOf(address(this));
         currentEthRate = ethRewardRate;
         currentEmarkRate = emarkRewardRate;
@@ -310,10 +314,10 @@ contract EvermarkRewards is
     }
 
     function getUserRewardInfo(address user) external view returns (
-        uint256 pendingEth,
+        uint256 pendingEth,     // Pending WETH rewards
         uint256 pendingEmark,
         uint256 stakedAmount,
-        uint256 periodEthRewards,
+        uint256 periodEthRewards,    // Period WETH rewards
         uint256 periodEmarkRewards
     ) {
         pendingEth = ethEarned(user);
@@ -331,7 +335,7 @@ contract EvermarkRewards is
     /* ========== MUTATIVE FUNCTIONS ========== */
 
     function claimRewards() external nonReentrant whenNotPaused onlyWhenActive updateReward(msg.sender) {
-        uint256 ethReward = ethRewards_user[msg.sender];
+        uint256 ethReward = ethRewards_user[msg.sender];    // WETH reward amount
         uint256 emarkReward = emarkRewards_user[msg.sender];
         
         require(ethReward > 0 || emarkReward > 0, "No rewards to claim");
@@ -340,8 +344,8 @@ contract EvermarkRewards is
             ethRewards_user[msg.sender] = 0;
             ethTotalDistributed += ethReward;
             
-            (bool success, ) = payable(msg.sender).call{value: ethReward}("");
-            require(success, "ETH transfer failed");
+            // Use WETH transfer instead of native ETH
+            wethToken.safeTransfer(msg.sender, ethReward);
             
             emit EthRewardPaid(msg.sender, ethReward);
         }
@@ -358,13 +362,15 @@ contract EvermarkRewards is
 
     /* ========== FUNDING FUNCTIONS ========== */
 
-    function fundEthRewards() external payable onlyRole(DISTRIBUTOR_ROLE) onlyWhenActive {
-        require(msg.value > 0, "Must send ETH");
-        emit EthPoolFunded(msg.value, msg.sender);
+    // CHANGED: Replace fundEthRewards with fundWethRewards
+    function fundWethRewards(uint256 amount) external onlyRole(DISTRIBUTOR_ROLE) onlyWhenActive {
+        require(amount > 0, "Amount must be > 0");
+        wethToken.safeTransferFrom(msg.sender, address(this), amount);
+        emit EthPoolFunded(amount, msg.sender);
         // Rates will be updated at next rebalance
     }
 
-    function fundRewards(uint256 amount) external onlyRole(DISTRIBUTOR_ROLE) onlyWhenActive {
+    function fundEmarkRewards(uint256 amount) external onlyRole(DISTRIBUTOR_ROLE) onlyWhenActive {
         require(amount > 0, "Amount must be > 0");
         emarkToken.safeTransferFrom(msg.sender, address(this), amount);
         emit EmarkPoolFunded(amount, msg.sender);
@@ -373,10 +379,10 @@ contract EvermarkRewards is
 
     /* ========== ADMIN FUNCTIONS ========== */
 
-    function setEthDistributionRate(uint256 _rate) external onlyRole(ADMIN_ROLE) {
+    function setWethDistributionRate(uint256 _rate) external onlyRole(ADMIN_ROLE) {
         require(_rate <= 50000, "Rate too high");
         ethDistributionRate = _rate;
-        emit DistributionRateUpdated("ETH", _rate);
+        emit DistributionRateUpdated("WETH", _rate);
     }
 
     function setEmarkDistributionRate(uint256 _rate) external onlyRole(ADMIN_ROLE) {
@@ -388,6 +394,11 @@ contract EvermarkRewards is
     function setRebalancePeriod(uint256 _period) external onlyRole(ADMIN_ROLE) {
         require(_period >= 1 hours, "Period too short");
         rebalancePeriod = _period;
+    }
+
+    function setWethToken(address _wethToken) external onlyRole(ADMIN_ROLE) {
+        require(_wethToken != address(0), "Invalid WETH address");
+        wethToken = IERC20(_wethToken);
     }
 
     /**
@@ -405,7 +416,7 @@ contract EvermarkRewards is
         _unpause();
     }
 
-    receive() external payable {}
+    // REMOVED: receive() function - no longer accepting native ETH
 
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
 
