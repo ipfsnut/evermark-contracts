@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /*
@@ -15,327 +18,505 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 */
 
 interface IEvermarkRewards {
-    function distributeProtocolFees(uint256 amount) external;
+    function fundRewards(uint256 amount) external;
 }
 
-contract FeeCollector is Ownable, ReentrancyGuard {
-    address public evermarkRewards;
-    address public treasuryWallet;
-    address public devWallet;
-    IERC20 public emarkToken;
+contract FeeCollector is 
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    ReentrancyGuardUpgradeable
+{
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant FEE_MANAGER_ROLE = keccak256("FEE_MANAGER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    struct TokenConfig {
+        bool supported;
+        address tokenAddress; // address(0) for ETH
+        string name;
+        uint256 totalCollected;
+    }
+
+    struct FeeDestination {
+        address destination;
+        uint256 basisPoints; // Out of 10000 (100.00%)
+        string name;
+        bool active;
+    }
+
+    // Supported tokens
+    mapping(string => TokenConfig) public supportedTokens; // "ETH", "EMARK", etc.
+    string[] public tokenSymbols;
     
-    uint256 public totalEmarkCollected;
-    uint256 public totalEthCollected; 
-    uint256 public totalNftFeesCollected;
-    uint256 public totalAuctionFeesCollected;
+    // Fee routing: tokenSymbol => destinations[]
+    mapping(string => FeeDestination[]) public feeDestinations;
     
-    uint256 public pendingTreasuryEth;
-    uint256 public pendingDevEth;
-    uint256 public pendingRewardsEth;
+    // Special contract integrations
+    IEvermarkRewards public evermarkRewards;
     
-    uint256 public treasuryPercentage = 3000;
-    uint256 public devPercentage = 1000;
-    uint256 public rewardsPercentage = 6000;
-    
+    // Emergency controls
     uint256 public emergencyPauseTimestamp;
     
-    event EmarkFeesCollected(uint256 amount);
-    event EthFeesCollected(uint256 amount);
-    event NftFeesCollected(uint256 amount);
-    event AuctionFeesCollected(uint256 amount);
-    event FeesRouted(address indexed destination, uint256 amount, string feeType);
-    event FeePercentagesUpdated(uint256 treasury, uint256 dev, uint256 rewards);
-    event ContractUpdated(string contractType, address indexed oldAddress, address indexed newAddress);
-    event FeesStored(uint256 treasury, uint256 dev, uint256 rewards);
-    event EmergencyPauseSet(uint256 timestamp);
+    // Statistics tracking
+    uint256 public totalEthCollected;
+    uint256 public totalTokensProcessed;
     
+    // Events
+    event FeeCollected(string indexed tokenSymbol, uint256 amount, address indexed from, string source);
+    event FeeRouted(string indexed tokenSymbol, address indexed to, uint256 amount, string destinationName);
+    event TokenAdded(string symbol, address tokenAddress, string name);
+    event DestinationConfigured(string tokenSymbol, address destination, uint256 basisPoints, string name);
+    event EvermarkRewardsUpdated(address indexed newContract);
+    event BatchProcessed(string tokenSymbol, uint256 totalAmount, uint256 destinationCount);
+    event EmergencyPauseSet(uint256 timestamp);
+
     modifier notInEmergency() {
         require(block.timestamp > emergencyPauseTimestamp, "Emergency pause active");
         _;
     }
-    
-    constructor(
-        address _treasuryWallet,
-        address _devWallet
-    ) Ownable(msg.sender) {
-        require(_treasuryWallet != address(0), "Invalid treasury wallet");
-        require(_devWallet != address(0), "Invalid dev wallet");
-        
-        treasuryWallet = _treasuryWallet;
-        devWallet = _devWallet;
-        emergencyPauseTimestamp = 0;
+
+    constructor() {
+        _disableInitializers();
     }
-    
-    function collectNftCreationFees() external payable notInEmergency {
-        require(msg.value > 0, "No fees to collect");
-        totalNftFeesCollected += msg.value;
+
+    function initialize() external initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        _grantRole(FEE_MANAGER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+
+        // Add ETH support by default
+        _addTokenSupport("ETH", address(0), "Ethereum");
+    }
+
+    // ============ FEE COLLECTION FUNCTIONS ============
+
+    /**
+     * @notice Collect ETH fees with automatic routing
+     * @param source Description of fee source for tracking
+     */
+    function collectETH(string calldata source) external payable whenNotPaused notInEmergency {
+        require(msg.value > 0, "No ETH sent");
+        
+        supportedTokens["ETH"].totalCollected += msg.value;
         totalEthCollected += msg.value;
-        emit NftFeesCollected(msg.value);
         
-        _storeFees(msg.value);
+        emit FeeCollected("ETH", msg.value, msg.sender, source);
+        
+        // Automatically route fees
+        _routeFees("ETH", msg.value);
     }
-    
-    function collectAuctionFees() external payable notInEmergency {
-        require(msg.value > 0, "No fees to collect");
-        totalAuctionFeesCollected += msg.value;
-        totalEthCollected += msg.value;
-        emit AuctionFeesCollected(msg.value);
-        
-        _storeFees(msg.value);
+
+    /**
+     * @notice Collect NFT creation fees (convenience function)
+     */
+    function collectNftCreationFees() external payable whenNotPaused notInEmergency {
+        require(msg.value > 0, "No fees sent");
+        this.collectETH{value: msg.value}("NFT_CREATION");
     }
-    
-    function _storeFees(uint256 amount) internal {
-        if (amount == 0) return;
-        
-        uint256 toTreasury = (amount * treasuryPercentage) / 10000;
-        uint256 toDev = (amount * devPercentage) / 10000;
-        uint256 toRewards = amount - toTreasury - toDev;
-        
-        pendingTreasuryEth += toTreasury;
-        pendingDevEth += toDev;
-        pendingRewardsEth += toRewards;
-        
-        emit FeesStored(toTreasury, toDev, toRewards);
+
+    /**
+     * @notice Collect auction fees (convenience function) 
+     */
+    function collectAuctionFees() external payable whenNotPaused notInEmergency {
+        require(msg.value > 0, "No fees sent");
+        this.collectETH{value: msg.value}("AUCTION");
     }
-    
-    function distributePendingEthFees() external nonReentrant notInEmergency {
-        uint256 toTreasury = pendingTreasuryEth;
-        uint256 toDev = pendingDevEth;
-        uint256 toRewards = pendingRewardsEth;
+
+    /**
+     * @notice Collect ERC20 token fees
+     * @param tokenSymbol Token symbol (e.g., "EMARK", "USDC")
+     * @param amount Amount to collect
+     * @param source Description of fee source
+     */
+    function collectToken(
+        string calldata tokenSymbol,
+        uint256 amount,
+        string calldata source
+    ) external whenNotPaused notInEmergency {
+        require(amount > 0, "Amount must be > 0");
+        require(supportedTokens[tokenSymbol].supported, "Token not supported");
+        require(supportedTokens[tokenSymbol].tokenAddress != address(0), "Use collectETH for ETH");
         
-        pendingTreasuryEth = 0;
-        pendingDevEth = 0;
-        pendingRewardsEth = 0;
+        IERC20 token = IERC20(supportedTokens[tokenSymbol].tokenAddress);
+        token.transferFrom(msg.sender, address(this), amount);
         
-        if (toTreasury > 0 && treasuryWallet != address(0)) {
-            (bool success, ) = payable(treasuryWallet).call{value: toTreasury}("");
-            if (success) {
-                emit FeesRouted(treasuryWallet, toTreasury, "Treasury ETH");
-            } else {
-                pendingTreasuryEth += toTreasury;
+        supportedTokens[tokenSymbol].totalCollected += amount;
+        totalTokensProcessed++;
+        
+        emit FeeCollected(tokenSymbol, amount, msg.sender, source);
+        
+        // Automatically route fees
+        _routeFees(tokenSymbol, amount);
+    }
+
+    /**
+     * @notice Collect EMARK trading fees (convenience function)
+     * @param amount Amount of EMARK to collect
+     */
+    function collectEmarkTradingFees(uint256 amount) external whenNotPaused notInEmergency {
+        this.collectToken("EMARK", amount, "TRADING");
+    }
+
+    /**
+     * @notice Deposit EMARK fees directly
+     * @param amount Amount to deposit
+     */
+    function depositEmarkFees(uint256 amount) external whenNotPaused notInEmergency {
+        this.collectToken("EMARK", amount, "DEPOSIT");
+    }
+
+    // ============ INTERNAL FEE ROUTING ============
+
+    /**
+     * @notice Internal fee routing logic
+     * @param tokenSymbol Token to route
+     * @param amount Total amount to distribute
+     */
+    function _routeFees(string memory tokenSymbol, uint256 amount) internal {
+        FeeDestination[] memory destinations = feeDestinations[tokenSymbol];
+        require(destinations.length > 0, "No destinations configured");
+        
+        uint256 remainingAmount = amount;
+        uint256 totalBasisPoints = 0;
+        
+        // Calculate total basis points for active destinations
+        for (uint256 i = 0; i < destinations.length; i++) {
+            if (destinations[i].active) {
+                totalBasisPoints += destinations[i].basisPoints;
             }
         }
         
-        if (toDev > 0 && devWallet != address(0)) {
-            (bool success, ) = payable(devWallet).call{value: toDev}("");
-            if (success) {
-                emit FeesRouted(devWallet, toDev, "Dev ETH");
+        require(totalBasisPoints == 10000, "Basis points must sum to 10000");
+        
+        // Route to each destination
+        for (uint256 i = 0; i < destinations.length; i++) {
+            if (!destinations[i].active) continue;
+            
+            uint256 destinationAmount;
+            
+            // Last active destination gets remainder to avoid rounding issues
+            if (i == destinations.length - 1) {
+                destinationAmount = remainingAmount;
             } else {
-                pendingDevEth += toDev;
+                destinationAmount = (amount * destinations[i].basisPoints) / 10000;
+                remainingAmount -= destinationAmount;
+            }
+            
+            if (destinationAmount > 0) {
+                _sendToDestination(tokenSymbol, destinations[i].destination, destinationAmount, destinations[i].name);
             }
         }
         
-        if (toRewards > 0) {
-            emit FeesRouted(address(this), toRewards, "Rewards ETH Reserve");
-        }
+        emit BatchProcessed(tokenSymbol, amount, destinations.length);
     }
-    
-    function distributeTreasuryFees() external nonReentrant notInEmergency {
-        uint256 amount = pendingTreasuryEth;
-        require(amount > 0, "No treasury fees to distribute");
-        require(treasuryWallet != address(0), "Treasury wallet not set");
-        
-        pendingTreasuryEth = 0;
-        
-        (bool success, ) = payable(treasuryWallet).call{value: amount}("");
-        if (success) {
-            emit FeesRouted(treasuryWallet, amount, "Treasury ETH");
+
+    /**
+     * @notice Send tokens to specific destination with smart contract integration
+     */
+    function _sendToDestination(
+        string memory tokenSymbol,
+        address destination,
+        uint256 amount,
+        string memory destinationName
+    ) internal {
+        if (keccak256(bytes(tokenSymbol)) == keccak256(bytes("ETH"))) {
+            // Send ETH
+            (bool success, ) = payable(destination).call{value: amount}("");
+            require(success, string(abi.encodePacked("ETH transfer failed to ", destinationName)));
+            
         } else {
-            pendingTreasuryEth = amount;
-            revert("Treasury transfer failed");
+            // Send ERC20 token
+            IERC20 token = IERC20(supportedTokens[tokenSymbol].tokenAddress);
+            
+            // Try smart contract integration for EvermarkRewards
+            if (destination == address(evermarkRewards) && keccak256(bytes(tokenSymbol)) == keccak256(bytes("EMARK"))) {
+                try evermarkRewards.fundRewards(amount) {
+                    // Success - rewards contract was funded directly
+                } catch {
+                    // Fallback to direct transfer
+                    require(token.transfer(destination, amount), "EMARK transfer failed");
+                }
+            } else {
+                // Direct transfer
+                require(token.transfer(destination, amount), "Token transfer failed");
+            }
+        }
+        
+        emit FeeRouted(tokenSymbol, destination, amount, destinationName);
+    }
+
+    // ============ CONFIGURATION FUNCTIONS ============
+
+    /**
+     * @notice Add support for a new token
+     * @param symbol Token symbol (e.g., "USDC", "WETH")
+     * @param tokenAddress Token contract address
+     * @param name Human readable name
+     */
+    function addTokenSupport(
+        string calldata symbol,
+        address tokenAddress,
+        string calldata name
+    ) external onlyRole(ADMIN_ROLE) {
+        require(!supportedTokens[symbol].supported, "Token already supported");
+        require(tokenAddress != address(0), "Use ETH for zero address");
+        
+        _addTokenSupport(symbol, tokenAddress, name);
+    }
+
+    function _addTokenSupport(string memory symbol, address tokenAddress, string memory name) internal {
+        supportedTokens[symbol] = TokenConfig({
+            supported: true,
+            tokenAddress: tokenAddress,
+            name: name,
+            totalCollected: 0
+        });
+        
+        tokenSymbols.push(symbol);
+        
+        emit TokenAdded(symbol, tokenAddress, name);
+    }
+
+    /**
+     * @notice Configure fee destinations for a token
+     * @param tokenSymbol Token to configure
+     * @param destinations Array of destination addresses
+     * @param basisPoints Array of basis points (must sum to 10000)
+     * @param names Array of destination names
+     */
+    function configureFeeDestinations(
+        string calldata tokenSymbol,
+        address[] calldata destinations,
+        uint256[] calldata basisPoints,
+        string[] calldata names
+    ) external onlyRole(ADMIN_ROLE) {
+        require(supportedTokens[tokenSymbol].supported, "Token not supported");
+        require(destinations.length == basisPoints.length, "Array length mismatch");
+        require(destinations.length == names.length, "Array length mismatch");
+        require(destinations.length > 0, "Must have at least one destination");
+        
+        // Clear existing destinations
+        delete feeDestinations[tokenSymbol];
+        
+        uint256 totalBasisPoints = 0;
+        
+        // Add new destinations
+        for (uint256 i = 0; i < destinations.length; i++) {
+            require(destinations[i] != address(0), "Invalid destination address");
+            require(basisPoints[i] > 0, "Basis points must be > 0");
+            
+            totalBasisPoints += basisPoints[i];
+            
+            feeDestinations[tokenSymbol].push(FeeDestination({
+                destination: destinations[i],
+                basisPoints: basisPoints[i],
+                name: names[i],
+                active: true
+            }));
+            
+            emit DestinationConfigured(tokenSymbol, destinations[i], basisPoints[i], names[i]);
+        }
+        
+        require(totalBasisPoints == 10000, "Basis points must sum to 10000 (100%)");
+    }
+
+    /**
+     * @notice Quick setup for standard 3-way split
+     * @param tokenSymbol Token to configure  
+     * @param treasuryAddress Treasury wallet address
+     * @param devAddress Development wallet address
+     * @param rewardsAddress Rewards contract address
+     * @param treasuryBasisPoints Treasury percentage in basis points (e.g., 3000 = 30%)
+     * @param devBasisPoints Dev percentage in basis points (e.g., 1000 = 10%)
+     */
+    function setupStandardSplit(
+        string calldata tokenSymbol,
+        address treasuryAddress,
+        address devAddress,
+        address rewardsAddress,
+        uint256 treasuryBasisPoints,
+        uint256 devBasisPoints
+    ) external onlyRole(ADMIN_ROLE) {
+        require(treasuryBasisPoints + devBasisPoints < 10000, "Treasury + Dev must be < 100%");
+        
+        uint256 rewardsBasisPoints = 10000 - treasuryBasisPoints - devBasisPoints;
+        
+        address[] memory destinations = new address[](3);
+        uint256[] memory basisPoints = new uint256[](3);
+        string[] memory names = new string[](3);
+        
+        destinations[0] = treasuryAddress;
+        destinations[1] = devAddress;
+        destinations[2] = rewardsAddress;
+        
+        basisPoints[0] = treasuryBasisPoints;
+        basisPoints[1] = devBasisPoints;
+        basisPoints[2] = rewardsBasisPoints;
+        
+        names[0] = "Treasury";
+        names[1] = "Development";
+        names[2] = "Rewards";
+        
+        this.configureFeeDestinations(tokenSymbol, destinations, basisPoints, names);
+    }
+
+    /**
+     * @notice Bootstrap with standard configuration
+     * @param emarkTokenAddress $EMARK token address
+     * @param evermarkRewardsAddress EvermarkRewards contract address
+     * @param treasuryAddress Treasury wallet
+     * @param devAddress Dev wallet
+     */
+    function bootstrapStandardConfig(
+        address emarkTokenAddress,
+        address evermarkRewardsAddress,
+        address treasuryAddress,
+        address devAddress
+    ) external onlyRole(ADMIN_ROLE) {
+        // Add EMARK token support
+        _addTokenSupport("EMARK", emarkTokenAddress, "Evermark Token");
+        
+        // Set EvermarkRewards contract
+        evermarkRewards = IEvermarkRewards(evermarkRewardsAddress);
+        emit EvermarkRewardsUpdated(evermarkRewardsAddress);
+        
+        // Setup standard splits: Treasury 30%, Dev 10%, Rewards 60%
+        this.setupStandardSplit("ETH", treasuryAddress, devAddress, address(0), 3000, 1000);
+        this.setupStandardSplit("EMARK", treasuryAddress, devAddress, evermarkRewardsAddress, 3000, 1000);
+    }
+
+    // ============ VIEW FUNCTIONS ============
+
+    /**
+     * @notice Get fee destinations for a token
+     */
+    function getFeeDestinations(string calldata tokenSymbol) external view returns (FeeDestination[] memory) {
+        return feeDestinations[tokenSymbol];
+    }
+
+    /**
+     * @notice Get supported tokens list
+     */
+    function getSupportedTokens() external view returns (string[] memory symbols, TokenConfig[] memory configs) {
+        symbols = tokenSymbols;
+        configs = new TokenConfig[](tokenSymbols.length);
+        
+        for (uint256 i = 0; i < tokenSymbols.length; i++) {
+            configs[i] = supportedTokens[tokenSymbols[i]];
         }
     }
-    
-    function distributeDevFees() external nonReentrant notInEmergency {
-        uint256 amount = pendingDevEth;
-        require(amount > 0, "No dev fees to distribute");
-        require(devWallet != address(0), "Dev wallet not set");
+
+    /**
+     * @notice Get collection statistics for all tokens
+     */
+    function getCollectionStats() external view returns (
+        string[] memory symbols,
+        uint256[] memory totals,
+        uint256 totalEthProcessed,
+        uint256 totalTokenTransactions
+    ) {
+        symbols = tokenSymbols;
+        totals = new uint256[](tokenSymbols.length);
         
-        pendingDevEth = 0;
+        for (uint256 i = 0; i < tokenSymbols.length; i++) {
+            totals[i] = supportedTokens[tokenSymbols[i]].totalCollected;
+        }
         
-        (bool success, ) = payable(devWallet).call{value: amount}("");
-        if (success) {
-            emit FeesRouted(devWallet, amount, "Dev ETH");
-        } else {
-            pendingDevEth = amount;
-            revert("Dev transfer failed");
+        totalEthProcessed = totalEthCollected;
+        totalTokenTransactions = totalTokensProcessed;
+    }
+
+    /**
+     * @notice Preview fee split for an amount
+     * @param tokenSymbol Token symbol
+     * @param amount Amount to split
+     * @return destinations Destination addresses
+     * @return amounts Split amounts
+     * @return names Destination names
+     */
+    function previewFeeSplit(string calldata tokenSymbol, uint256 amount) external view returns (
+        address[] memory destinations,
+        uint256[] memory amounts,
+        string[] memory names
+    ) {
+        FeeDestination[] memory dests = feeDestinations[tokenSymbol];
+        
+        destinations = new address[](dests.length);
+        amounts = new uint256[](dests.length);
+        names = new string[](dests.length);
+        
+        for (uint256 i = 0; i < dests.length; i++) {
+            destinations[i] = dests[i].destination;
+            amounts[i] = (amount * dests[i].basisPoints) / 10000;
+            names[i] = dests[i].name;
         }
     }
-    
-    function collectEmarkTradingFees(uint256 amount) external notInEmergency {
-        require(amount > 0, "No fees to collect");
-        require(address(emarkToken) != address(0), "EMARK token not set");
-        
-        emarkToken.transferFrom(msg.sender, address(this), amount);
-        totalEmarkCollected += amount;
-        emit EmarkFeesCollected(amount);
+
+    // ============ ADMIN FUNCTIONS ============
+
+    function setEvermarkRewards(address _evermarkRewards) external onlyRole(ADMIN_ROLE) {
+        evermarkRewards = IEvermarkRewards(_evermarkRewards);
+        emit EvermarkRewardsUpdated(_evermarkRewards);
     }
-    
-    function depositEmarkFees(uint256 amount) external notInEmergency {
-        require(amount > 0, "No fees to deposit");
-        require(address(emarkToken) != address(0), "EMARK token not set");
-        
-        emarkToken.transferFrom(msg.sender, address(this), amount);
-        totalEmarkCollected += amount;
-        emit EmarkFeesCollected(amount);
-    }
-    
-    function routeEmarkToRewards() external nonReentrant notInEmergency {
-        require(address(emarkToken) != address(0), "EMARK token not set");
-        require(evermarkRewards != address(0), "Rewards contract not set");
-        
-        uint256 amount = emarkToken.balanceOf(address(this));
-        require(amount > 0, "No EMARK to route");
-        
-        bool transferSuccess = emarkToken.transfer(evermarkRewards, amount);
-        require(transferSuccess, "EMARK transfer failed");
-        
-        try IEvermarkRewards(evermarkRewards).distributeProtocolFees(amount) {
-            emit FeesRouted(evermarkRewards, amount, "EMARK");
-        } catch {
-            emit FeesRouted(evermarkRewards, amount, "EMARK (notification failed)");
-        }
-    }
-    
-    function updateFeePercentages(
-        uint256 _treasuryPercentage,
-        uint256 _devPercentage,
-        uint256 _rewardsPercentage
-    ) external onlyOwner {
-        require(
-            _treasuryPercentage + _devPercentage + _rewardsPercentage == 10000,
-            "Percentages must sum to 100%"
-        );
-        
-        treasuryPercentage = _treasuryPercentage;
-        devPercentage = _devPercentage;
-        rewardsPercentage = _rewardsPercentage;
-        
-        emit FeePercentagesUpdated(_treasuryPercentage, _devPercentage, _rewardsPercentage);
-    }
-    
-    function setEvermarkRewards(address _evermarkRewards) external onlyOwner {
-        address oldAddress = evermarkRewards;
-        evermarkRewards = _evermarkRewards;
-        emit ContractUpdated("EvermarkRewards", oldAddress, _evermarkRewards);
-    }
-    
-    function setEmarkToken(address _emarkToken) external onlyOwner {
-        address oldAddress = address(emarkToken);
-        emarkToken = IERC20(_emarkToken);
-        emit ContractUpdated("EmarkToken", oldAddress, _emarkToken);
-    }
-    
-    function setTreasuryWallet(address _treasuryWallet) external onlyOwner {
-        require(_treasuryWallet != address(0), "Invalid treasury wallet");
-        address oldAddress = treasuryWallet;
-        treasuryWallet = _treasuryWallet;
-        emit ContractUpdated("TreasuryWallet", oldAddress, _treasuryWallet);
-    }
-    
-    function setDevWallet(address _devWallet) external onlyOwner {
-        require(_devWallet != address(0), "Invalid dev wallet");
-        address oldAddress = devWallet;
-        devWallet = _devWallet;
-        emit ContractUpdated("DevWallet", oldAddress, _devWallet);
-    }
-    
-    function getFeeBreakdown(uint256 amount) external view returns (
-        uint256 treasuryAmount,
-        uint256 devAmount,
-        uint256 rewardsAmount
-    ) {
-        treasuryAmount = (amount * treasuryPercentage) / 10000;
-        devAmount = (amount * devPercentage) / 10000;
-        rewardsAmount = amount - treasuryAmount - devAmount;
-    }
-    
-    function getCollectedFees() external view returns (
-        uint256 emarkFees,
-        uint256 ethFees,
-        uint256 nftFees,
-        uint256 auctionFees
-    ) {
-        return (totalEmarkCollected, totalEthCollected, totalNftFeesCollected, totalAuctionFeesCollected);
-    }
-    
-    function getPendingEthFees() external view returns (
-        uint256 treasury,
-        uint256 dev,
-        uint256 rewards,
-        uint256 total
-    ) {
-        return (
-            pendingTreasuryEth,
-            pendingDevEth,
-            pendingRewardsEth,
-            pendingTreasuryEth + pendingDevEth + pendingRewardsEth
-        );
-    }
-    
-    function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyOwner {
+
+    function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyRole(ADMIN_ROLE) {
         emergencyPauseTimestamp = pauseUntilTimestamp;
         emit EmergencyPauseSet(pauseUntilTimestamp);
     }
-    
-    function clearEmergencyPause() external onlyOwner {
+
+    function clearEmergencyPause() external onlyRole(ADMIN_ROLE) {
         emergencyPauseTimestamp = 0;
         emit EmergencyPauseSet(0);
     }
-    
-    function emergencyWithdrawEth(address payable recipient) external onlyOwner {
-        require(recipient != address(0), "Invalid recipient");
-        uint256 balance = address(this).balance;
-        require(balance > 0, "No ETH to withdraw");
-        
-        pendingTreasuryEth = 0;
-        pendingDevEth = 0;
-        pendingRewardsEth = 0;
-        
-        (bool success, ) = recipient.call{value: balance}("");
-        require(success, "Emergency withdrawal failed");
+
+    function emergencyWithdrawETH(address payable recipient, uint256 amount) external onlyRole(ADMIN_ROLE) {
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Emergency ETH withdrawal failed");
     }
-    
+
     function emergencyWithdrawToken(
-        address token,
+        string calldata tokenSymbol,
         address recipient,
         uint256 amount
-    ) external onlyOwner {
-        require(recipient != address(0), "Invalid recipient");
-        require(token != address(0), "Invalid token");
-        
-        IERC20(token).transfer(recipient, amount);
+    ) external onlyRole(ADMIN_ROLE) {
+        require(supportedTokens[tokenSymbol].supported, "Token not supported");
+        IERC20 token = IERC20(supportedTokens[tokenSymbol].tokenAddress);
+        require(token.transfer(recipient, amount), "Emergency token withdrawal failed");
     }
-    
-    function batchDistributeEmarkFees() external nonReentrant notInEmergency {
-        require(address(emarkToken) != address(0), "EMARK token not set");
-        require(evermarkRewards != address(0), "Rewards contract not set");
-        
-        uint256 emarkBalance = emarkToken.balanceOf(address(this));
-        if (emarkBalance > 0) {
-            try this.routeEmarkToRewards() {
-            } catch {
-            }
-        }
-        
-        try this.distributePendingEthFees() {
-        } catch {
-        }
+
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
     }
-    
+
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+
+    function version() external pure returns (string memory) {
+        return "2.0.0";
+    }
+
+    // Receive ETH directly (e.g., from contract sales)
     receive() external payable {
         if (msg.value > 0) {
+            supportedTokens["ETH"].totalCollected += msg.value;
             totalEthCollected += msg.value;
-            emit EthFeesCollected(msg.value);
-            _storeFees(msg.value);
+            emit FeeCollected("ETH", msg.value, msg.sender, "Direct");
+            _routeFees("ETH", msg.value);
         }
     }
-    
-    fallback() external payable {
-        if (msg.value > 0) {
-            totalEthCollected += msg.value;
-            emit EthFeesCollected(msg.value);
-            _storeFees(msg.value);
-        }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+
+    function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
+        return super.supportsInterface(interfaceId);
     }
 }
