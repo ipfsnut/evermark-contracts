@@ -175,6 +175,77 @@ contract CardCatalog is
         return emarkToken.balanceOf(address(this));
     }
 
+    // ============ REWARDS COMPATIBILITY FUNCTIONS ============
+    // Added for EvermarkRewards integration
+    
+    /**
+     * @notice Get staking data for multiple users (EvermarkRewards compatibility)
+     * @param users Array of user addresses
+     * @return balances Array of wEMARK balances
+     * @return delegated Array of delegated voting power amounts
+     * @return totalStaked Total wEMARK supply
+     */
+    function getBatchStakingData(address[] calldata users) external view returns (
+        uint256[] memory balances,
+        uint256[] memory delegated,
+        uint256 totalStaked
+    ) {
+        uint256 length = users.length;
+        balances = new uint256[](length);
+        delegated = new uint256[](length);
+        
+        for (uint256 i = 0; i < length; i++) {
+            balances[i] = balanceOf(users[i]);
+            delegated[i] = getDelegatedVotingPower(users[i]);
+        }
+        
+        totalStaked = totalSupply();
+        return (balances, delegated, totalStaked);
+    }
+    
+    /**
+     * @notice Get individual user staking info (EvermarkRewards compatibility)
+     * @param user User address
+     * @return wEmarkBalance User's wEMARK balance
+     * @return totalStaked Total wEMARK supply
+     * @return delegatedPower User's delegated voting power
+     */
+    function getUserStakingInfo(address user) external view returns (
+        uint256 wEmarkBalance,
+        uint256 totalStaked,
+        uint256 delegatedPower
+    ) {
+        return (
+            balanceOf(user),
+            totalSupply(), 
+            getDelegatedVotingPower(user)
+        );
+    }
+    
+    /**
+     * @notice Get staking statistics for rewards calculation
+     * @return totalWEmark Total wEMARK supply
+     * @return totalLiquidEmark Total liquid $EMARK held by contract
+     * @return totalUnbonding Total wEMARK in unbonding process
+     * @return activeStakers Number of addresses with wEMARK balance > 0
+     */
+    function getStakingStats() external view returns (
+        uint256 totalWEmark,
+        uint256 totalLiquidEmark,
+        uint256 totalUnbonding,
+        uint256 activeStakers
+    ) {
+        totalWEmark = totalSupply();
+        totalLiquidEmark = emarkToken.balanceOf(address(this));
+        totalUnbonding = totalUnbondingAmount;
+        
+        // Note: activeStakers would require tracking in a separate mapping
+        // For now, return 0 as it's not critical for rewards calculation
+        activeStakers = 0;
+    }
+
+    // ============ ADMIN FUNCTIONS ============
+
     function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyRole(ADMIN_ROLE) {
         emergencyPauseTimestamp = pauseUntilTimestamp;
         emit EmergencyPauseSet(pauseUntilTimestamp);
