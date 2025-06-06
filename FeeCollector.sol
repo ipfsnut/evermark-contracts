@@ -17,8 +17,16 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  ╚═╝     ╚══════╝╚══════╝     ╚═════╝ ╚═════╝ ╚══════╝╚══════╝╚══════╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
 */
 
+// Interface for EvermarkRewards contract
 interface IEvermarkRewards {
-    function fundRewards(uint256 amount) external;
+    function fundWethRewards(uint256 amount) external;
+    function fundEmarkRewards(uint256 amount) external;
+}
+
+// Interface for WETH contract
+interface IWETH is IERC20 {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
 }
 
 contract FeeCollector is 
@@ -47,7 +55,7 @@ contract FeeCollector is
     }
 
     // Supported tokens
-    mapping(string => TokenConfig) public supportedTokens; // "ETH", "EMARK", etc.
+    mapping(string => TokenConfig) public supportedTokens; // "ETH", "WETH", "EMARK", etc.
     string[] public tokenSymbols;
     
     // Fee routing: tokenSymbol => destinations[]
@@ -71,6 +79,7 @@ contract FeeCollector is
     event EvermarkRewardsUpdated(address indexed newContract);
     event BatchProcessed(string tokenSymbol, uint256 totalAmount, uint256 destinationCount);
     event EmergencyPauseSet(uint256 timestamp);
+    event EthWrappedForRewards(uint256 amount); // NEW: Track ETH→WETH conversions
 
     modifier notInEmergency() {
         require(block.timestamp > emergencyPauseTimestamp, "Emergency pause active");
@@ -123,16 +132,8 @@ contract FeeCollector is
     }
 
     /**
-     * @notice Collect auction fees (convenience function) 
-     */
-    function collectAuctionFees() external payable whenNotPaused notInEmergency {
-        require(msg.value > 0, "No fees sent");
-        this.collectETH{value: msg.value}("AUCTION");
-    }
-
-    /**
      * @notice Collect ERC20 token fees
-     * @param tokenSymbol Token symbol (e.g., "EMARK", "USDC")
+     * @param tokenSymbol Token symbol (e.g., "WETH", "EMARK", "USDC")
      * @param amount Amount to collect
      * @param source Description of fee source
      */
@@ -158,19 +159,19 @@ contract FeeCollector is
     }
 
     /**
-     * @notice Collect EMARK trading fees (convenience function)
-     * @param amount Amount of EMARK to collect
+     * @notice Collect WETH trading fees from Clanker (main use case)
+     * @param amount Amount of WETH to collect
      */
-    function collectEmarkTradingFees(uint256 amount) external whenNotPaused notInEmergency {
-        this.collectToken("EMARK", amount, "TRADING");
+    function collectWethTradingFees(uint256 amount) external whenNotPaused notInEmergency {
+        this.collectToken("WETH", amount, "CLANKER_TRADING");
     }
 
     /**
-     * @notice Deposit EMARK fees directly
+     * @notice Deposit WETH fees directly  
      * @param amount Amount to deposit
      */
-    function depositEmarkFees(uint256 amount) external whenNotPaused notInEmergency {
-        this.collectToken("EMARK", amount, "DEPOSIT");
+    function depositWethFees(uint256 amount) external whenNotPaused notInEmergency {
+        this.collectToken("WETH", amount, "DEPOSIT");
     }
 
     // ============ INTERNAL FEE ROUTING ============
@@ -220,6 +221,7 @@ contract FeeCollector is
 
     /**
      * @notice Send tokens to specific destination with smart contract integration
+     * UPDATED: ETH→WETH conversion for rewards integration
      */
     function _sendToDestination(
         string memory tokenSymbol,
@@ -228,26 +230,68 @@ contract FeeCollector is
         string memory destinationName
     ) internal {
         if (keccak256(bytes(tokenSymbol)) == keccak256(bytes("ETH"))) {
-            // Send ETH
-            (bool success, ) = payable(destination).call{value: amount}("");
-            require(success, string(abi.encodePacked("ETH transfer failed to ", destinationName)));
+            // Handle ETH - convert to WETH if going to rewards
+            if (destination == address(evermarkRewards)) {
+                // Convert ETH to WETH, then fund rewards
+                require(supportedTokens["WETH"].supported, "WETH not supported");
+                IWETH weth = IWETH(supportedTokens["WETH"].tokenAddress);
+                
+                weth.deposit{value: amount}();
+                weth.approve(address(evermarkRewards), amount);
+                
+                try evermarkRewards.fundWethRewards(amount) {
+                    // Success - ETH was wrapped and sent to rewards
+                    emit EthWrappedForRewards(amount);
+                } catch {
+                    // Fallback: send WETH directly
+                    require(weth.transfer(destination, amount), "WETH transfer failed");
+                }
+            } else {
+                // Direct ETH transfer to wallet
+                (bool success, ) = payable(destination).call{value: amount}("");
+                require(success, string(abi.encodePacked("ETH transfer failed to ", destinationName)));
+            }
             
-        } else {
-            // Send ERC20 token
-            IERC20 token = IERC20(supportedTokens[tokenSymbol].tokenAddress);
+        } else if (keccak256(bytes(tokenSymbol)) == keccak256(bytes("WETH"))) {
+            // Handle WETH - direct integration with EvermarkRewards
+            IERC20 wethToken = IERC20(supportedTokens[tokenSymbol].tokenAddress);
             
-            // Try smart contract integration for EvermarkRewards
-            if (destination == address(evermarkRewards) && keccak256(bytes(tokenSymbol)) == keccak256(bytes("EMARK"))) {
-                try evermarkRewards.fundRewards(amount) {
+            if (destination == address(evermarkRewards)) {
+                // Smart integration: approve and call fundWethRewards
+                wethToken.approve(address(evermarkRewards), amount);
+                try evermarkRewards.fundWethRewards(amount) {
                     // Success - rewards contract was funded directly
                 } catch {
                     // Fallback to direct transfer
-                    require(token.transfer(destination, amount), "EMARK transfer failed");
+                    require(wethToken.transfer(destination, amount), "WETH transfer failed");
                 }
             } else {
-                // Direct transfer
-                require(token.transfer(destination, amount), "Token transfer failed");
+                // Direct WETH transfer to wallet
+                require(wethToken.transfer(destination, amount), "WETH transfer failed");
             }
+            
+        } else if (keccak256(bytes(tokenSymbol)) == keccak256(bytes("EMARK"))) {
+            // Handle EMARK - smart integration with EvermarkRewards
+            IERC20 emarkToken = IERC20(supportedTokens[tokenSymbol].tokenAddress);
+            
+            if (destination == address(evermarkRewards)) {
+                // Smart integration: approve and call fundEmarkRewards
+                emarkToken.approve(address(evermarkRewards), amount);
+                try evermarkRewards.fundEmarkRewards(amount) {
+                    // Success - rewards contract was funded directly
+                } catch {
+                    // Fallback to direct transfer
+                    require(emarkToken.transfer(destination, amount), "EMARK transfer failed");
+                }
+            } else {
+                // Direct EMARK transfer to wallet
+                require(emarkToken.transfer(destination, amount), "EMARK transfer failed");
+            }
+            
+        } else {
+            // Handle any other ERC20 token
+            IERC20 token = IERC20(supportedTokens[tokenSymbol].tokenAddress);
+            require(token.transfer(destination, amount), "Token transfer failed");
         }
         
         emit FeeRouted(tokenSymbol, destination, amount, destinationName);
@@ -257,7 +301,7 @@ contract FeeCollector is
 
     /**
      * @notice Add support for a new token
-     * @param symbol Token symbol (e.g., "USDC", "WETH")
+     * @param symbol Token symbol (e.g., "WETH", "USDC")
      * @param tokenAddress Token contract address
      * @param name Human readable name
      */
@@ -329,68 +373,58 @@ contract FeeCollector is
     }
 
     /**
-     * @notice Quick setup for standard 3-way split
-     * @param tokenSymbol Token to configure  
-     * @param treasuryAddress Treasury wallet address
+     * @notice Quick setup for 50/50 dev/rewards split
+     * @param tokenSymbol Token to configure ("ETH", "WETH", or "EMARK")
      * @param devAddress Development wallet address
-     * @param rewardsAddress Rewards contract address
-     * @param treasuryBasisPoints Treasury percentage in basis points (e.g., 3000 = 30%)
-     * @param devBasisPoints Dev percentage in basis points (e.g., 1000 = 10%)
+     * @param rewardsAddress EvermarkRewards contract address
      */
-    function setupStandardSplit(
+    function setup50_50Split(
         string calldata tokenSymbol,
-        address treasuryAddress,
         address devAddress,
-        address rewardsAddress,
-        uint256 treasuryBasisPoints,
-        uint256 devBasisPoints
+        address rewardsAddress
     ) external onlyRole(ADMIN_ROLE) {
-        require(treasuryBasisPoints + devBasisPoints < 10000, "Treasury + Dev must be < 100%");
+        address[] memory destinations = new address[](2);
+        uint256[] memory basisPoints = new uint256[](2);
+        string[] memory names = new string[](2);
         
-        uint256 rewardsBasisPoints = 10000 - treasuryBasisPoints - devBasisPoints;
+        destinations[0] = devAddress;
+        destinations[1] = rewardsAddress;
         
-        address[] memory destinations = new address[](3);
-        uint256[] memory basisPoints = new uint256[](3);
-        string[] memory names = new string[](3);
+        basisPoints[0] = 5000; // 50%
+        basisPoints[1] = 5000; // 50%
         
-        destinations[0] = treasuryAddress;
-        destinations[1] = devAddress;
-        destinations[2] = rewardsAddress;
-        
-        basisPoints[0] = treasuryBasisPoints;
-        basisPoints[1] = devBasisPoints;
-        basisPoints[2] = rewardsBasisPoints;
-        
-        names[0] = "Treasury";
-        names[1] = "Development";
-        names[2] = "Rewards";
+        names[0] = "Development";
+        names[1] = "Staker Rewards";
         
         this.configureFeeDestinations(tokenSymbol, destinations, basisPoints, names);
     }
 
     /**
-     * @notice Bootstrap with standard configuration
-     * @param emarkTokenAddress $EMARK token address
+     * @notice Bootstrap with WETH + EMARK configuration for 50/50 splits
+     * UPDATED: Now supports ETH→WETH conversion for 50/50 split
+     * @param wethTokenAddress WETH token address
+     * @param emarkTokenAddress EMARK token address
      * @param evermarkRewardsAddress EvermarkRewards contract address
-     * @param treasuryAddress Treasury wallet
      * @param devAddress Dev wallet
      */
-    function bootstrapStandardConfig(
+    function bootstrapWethEmarkConfig(
+        address wethTokenAddress,
         address emarkTokenAddress,
         address evermarkRewardsAddress,
-        address treasuryAddress,
         address devAddress
     ) external onlyRole(ADMIN_ROLE) {
-        // Add EMARK token support
+        // Add token support
+        _addTokenSupport("WETH", wethTokenAddress, "Wrapped Ether");
         _addTokenSupport("EMARK", emarkTokenAddress, "Evermark Token");
         
         // Set EvermarkRewards contract
         evermarkRewards = IEvermarkRewards(evermarkRewardsAddress);
         emit EvermarkRewardsUpdated(evermarkRewardsAddress);
         
-        // Setup standard splits: Treasury 30%, Dev 10%, Rewards 60%
-        this.setupStandardSplit("ETH", treasuryAddress, devAddress, address(0), 3000, 1000);
-        this.setupStandardSplit("EMARK", treasuryAddress, devAddress, evermarkRewardsAddress, 3000, 1000);
+        // Setup 50/50 splits for all fee types
+        this.setup50_50Split("ETH", devAddress, evermarkRewardsAddress);    // NFT fees
+        this.setup50_50Split("WETH", devAddress, evermarkRewardsAddress);   // Clanker fees
+        this.setup50_50Split("EMARK", devAddress, evermarkRewardsAddress);  // EMARK fees
     }
 
     // ============ VIEW FUNCTIONS ============
@@ -400,38 +434,6 @@ contract FeeCollector is
      */
     function getFeeDestinations(string calldata tokenSymbol) external view returns (FeeDestination[] memory) {
         return feeDestinations[tokenSymbol];
-    }
-
-    /**
-     * @notice Get supported tokens list
-     */
-    function getSupportedTokens() external view returns (string[] memory symbols, TokenConfig[] memory configs) {
-        symbols = tokenSymbols;
-        configs = new TokenConfig[](tokenSymbols.length);
-        
-        for (uint256 i = 0; i < tokenSymbols.length; i++) {
-            configs[i] = supportedTokens[tokenSymbols[i]];
-        }
-    }
-
-    /**
-     * @notice Get collection statistics for all tokens
-     */
-    function getCollectionStats() external view returns (
-        string[] memory symbols,
-        uint256[] memory totals,
-        uint256 totalEthProcessed,
-        uint256 totalTokenTransactions
-    ) {
-        symbols = tokenSymbols;
-        totals = new uint256[](tokenSymbols.length);
-        
-        for (uint256 i = 0; i < tokenSymbols.length; i++) {
-            totals[i] = supportedTokens[tokenSymbols[i]].totalCollected;
-        }
-        
-        totalEthProcessed = totalEthCollected;
-        totalTokenTransactions = totalTokensProcessed;
     }
 
     /**
@@ -501,7 +503,7 @@ contract FeeCollector is
     }
 
     function version() external pure returns (string memory) {
-        return "2.0.0";
+        return "2.2.0";
     }
 
     // Receive ETH directly (e.g., from contract sales)
