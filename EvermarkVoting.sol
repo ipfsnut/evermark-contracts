@@ -19,13 +19,19 @@ import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.
 interface ICardCatalog {
     function getTotalVotingPower(address user) external view returns (uint256);
     function getAvailableVotingPower(address user) external view returns (uint256);
-    function reserveVotingPower(address user, uint256 amount) external; // 🔥 CRITICAL FIX
-    function releaseVotingPower(address user, uint256 amount) external; // 🔥 CRITICAL FIX
+    function reserveVotingPower(address user, uint256 amount) external;
+    function releaseVotingPower(address user, uint256 amount) external;
 }
 
 interface IEvermarkNFT {
     function exists(uint256 tokenId) external view returns (bool);
     function getEvermarkCreator(uint256 tokenId) external view returns (address);
+}
+
+interface ILiveLeaderboard {
+    function updateEvermarkInLeaderboard(uint256 cycle, uint256 evermarkId) external;
+    function batchUpdateLeaderboard(uint256 cycle, uint256[] calldata evermarkIds) external;
+    function getLeaderboardSize(uint256 cycle) external view returns (uint256);
 }
 
 contract EvermarkVoting is 
@@ -50,7 +56,7 @@ contract EvermarkVoting is
         uint256 totalVotes;
         uint256 totalDelegations;
         bool finalized;
-        uint256 activeEvermarksCount; // Simplified tracking - just count
+        uint256 activeEvermarksCount;
     }
 
     struct LeaderboardEntry {
@@ -60,19 +66,24 @@ contract EvermarkVoting is
 
     ICardCatalog public cardCatalog;
     IEvermarkNFT public evermarkNFT;
+    ILiveLeaderboard public liveLeaderboard;
     
     uint256 public currentCycle;
     uint256 public cycleStartTime;
     
-    // Core storage - gas optimized
     mapping(uint256 => VotingCycle) public votingCycles;
-    mapping(uint256 => mapping(uint256 => uint256)) public cycleEvermarkVotes; // cycle => evermarkId => votes
-    mapping(uint256 => mapping(address => uint256)) public cycleUserTotalVotes; // cycle => user => total votes
-    mapping(uint256 => mapping(address => mapping(uint256 => uint256))) public cycleUserEvermarkVotes; // cycle => user => evermarkId => votes
+    mapping(uint256 => mapping(uint256 => uint256)) public cycleEvermarkVotes;
+    mapping(uint256 => mapping(address => uint256)) public cycleUserTotalVotes;
+    mapping(uint256 => mapping(address => mapping(uint256 => uint256))) public cycleUserEvermarkVotes;
     
-    // Off-chain submitted leaderboards (gas efficient)
+    mapping(uint256 => uint256[]) public cycleActiveEvermarks;
+    mapping(uint256 => mapping(uint256 => bool)) public isEvermarkActiveInCycle;
+    mapping(uint256 => mapping(uint256 => uint256)) public evermarkIndexInCycle;
+    
     mapping(uint256 => LeaderboardEntry[]) public cycleLeaderboards;
     mapping(uint256 => bool) public leaderboardSubmitted;
+    
+    bool public autoUpdateLeaderboard;
     
     uint256 public emergencyPauseTimestamp;
     
@@ -82,6 +93,11 @@ contract EvermarkVoting is
     event CycleFinalized(uint256 indexed cycleNumber, uint256 totalVotes, uint256 totalEvermarks);
     event LeaderboardSubmitted(uint256 indexed cycle, uint256 entryCount);
     event EmergencyPauseSet(uint256 timestamp);
+    event LiveLeaderboardUpdated(address indexed leaderboard);
+    event AutoUpdateToggled(bool enabled);
+    event LeaderboardUpdateFailed(uint256 indexed cycle, uint256 indexed evermarkId, string reason);
+    event BatchLeaderboardUpdateFailed(uint256 indexed cycle, uint256[] evermarkIds, string reason);
+    event LeaderboardValidationFailed(address leaderboard, string reason);
 
     modifier notInEmergency() {
         require(block.timestamp > emergencyPauseTimestamp, "Emergency pause active");
@@ -111,6 +127,7 @@ contract EvermarkVoting is
         evermarkNFT = IEvermarkNFT(_evermarkNFT);
         
         emergencyPauseTimestamp = 0;
+        autoUpdateLeaderboard = false;
         
         currentCycle = 1;
         cycleStartTime = block.timestamp;
@@ -123,7 +140,6 @@ contract EvermarkVoting is
         emit NewVotingCycle(currentCycle, block.timestamp);
     }
 
-    // 🔥 CORE FUNCTIONALITY - Delegate votes (FIXED INTEGRATION)
     function delegateVotes(uint256 evermarkId, uint256 amount) external whenNotPaused notInEmergency nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
         require(evermarkNFT.exists(evermarkId), "Evermark does not exist");
@@ -139,7 +155,6 @@ contract EvermarkVoting is
         VotingCycle storage cycle = votingCycles[currentCycle];
         require(!cycle.finalized, "Current cycle is finalized");
         
-        // 🔥 CRITICAL FIX: Use new CardCatalog integration
         cardCatalog.reserveVotingPower(msg.sender, amount);
         
         bool isNewEvermark = cycleEvermarkVotes[currentCycle][evermarkId] == 0;
@@ -153,12 +168,17 @@ contract EvermarkVoting is
         if (isNewEvermark) {
             cycle.activeEvermarksCount++;
             require(cycle.activeEvermarksCount <= MAX_ACTIVE_EVERMARKS_PER_CYCLE, "Too many active evermarks this cycle");
+            
+            cycleActiveEvermarks[currentCycle].push(evermarkId);
+            isEvermarkActiveInCycle[currentCycle][evermarkId] = true;
+            evermarkIndexInCycle[currentCycle][evermarkId] = cycleActiveEvermarks[currentCycle].length - 1;
         }
+        
+        _updateLiveLeaderboardIfEnabled(currentCycle, evermarkId);
         
         emit VoteDelegated(msg.sender, evermarkId, amount, currentCycle);
     }
 
-    // 🔥 CORE FUNCTIONALITY - Undelegate votes (FIXED INTEGRATION)
     function undelegateVotes(uint256 evermarkId, uint256 amount) external whenNotPaused notInEmergency nonReentrant {
         require(amount > 0, "Amount must be greater than 0");
         
@@ -175,13 +195,13 @@ contract EvermarkVoting is
         cycleUserEvermarkVotes[currentCycle][msg.sender][evermarkId] -= amount;
         cycle.totalVotes -= amount;
         
-        // 🔥 CRITICAL FIX: Use new CardCatalog integration
         cardCatalog.releaseVotingPower(msg.sender, amount);
+        
+        _updateLiveLeaderboardIfEnabled(currentCycle, evermarkId);
         
         emit VoteUndelegated(msg.sender, evermarkId, amount, currentCycle);
     }
 
-    // ⚡ GAS OPTIMIZED - Batch delegation with upfront reserve
     function delegateVotesBatch(
         uint256[] calldata evermarkIds,
         uint256[] calldata amounts
@@ -197,16 +217,41 @@ contract EvermarkVoting is
         uint256 availablePower = cardCatalog.getAvailableVotingPower(msg.sender);
         require(availablePower >= totalAmount, "Insufficient voting power");
         
-        // Reserve all power upfront for gas efficiency
         cardCatalog.reserveVotingPower(msg.sender, totalAmount);
         
         _checkAndStartNewCycle();
         VotingCycle storage cycle = votingCycles[currentCycle];
         require(!cycle.finalized, "Current cycle is finalized");
         
+        uint256[] memory updatedEvermarkIds;
+        uint256 updateCount = 0;
+        
         for (uint256 i = 0; i < evermarkIds.length; i++) {
             if (amounts[i] > 0) {
-                _delegateVotesInternal(evermarkIds[i], amounts[i], cycle);
+                updateCount++;
+            }
+        }
+        
+        if (updateCount > 0) {
+            updatedEvermarkIds = new uint256[](updateCount);
+            uint256 currentIndex = 0;
+            
+            for (uint256 i = 0; i < evermarkIds.length; i++) {
+                if (amounts[i] > 0) {
+                    _delegateVotesInternal(evermarkIds[i], amounts[i], cycle);
+                    updatedEvermarkIds[currentIndex] = evermarkIds[i];
+                    currentIndex++;
+                }
+            }
+            
+            if (autoUpdateLeaderboard && address(liveLeaderboard) != address(0)) {
+                try liveLeaderboard.batchUpdateLeaderboard(currentCycle, updatedEvermarkIds) {
+                    
+                } catch Error(string memory reason) {
+                    emit BatchLeaderboardUpdateFailed(currentCycle, updatedEvermarkIds, reason);
+                } catch {
+                    emit BatchLeaderboardUpdateFailed(currentCycle, updatedEvermarkIds, "Unknown error");
+                }
             }
         }
     }
@@ -228,9 +273,84 @@ contract EvermarkVoting is
         if (isNewEvermark) {
             cycle.activeEvermarksCount++;
             require(cycle.activeEvermarksCount <= MAX_ACTIVE_EVERMARKS_PER_CYCLE, "Too many active evermarks this cycle");
+            
+            cycleActiveEvermarks[currentCycle].push(evermarkId);
+            isEvermarkActiveInCycle[currentCycle][evermarkId] = true;
+            evermarkIndexInCycle[currentCycle][evermarkId] = cycleActiveEvermarks[currentCycle].length - 1;
         }
         
         emit VoteDelegated(msg.sender, evermarkId, amount, currentCycle);
+    }
+
+    function _updateLiveLeaderboardIfEnabled(uint256 cycle, uint256 evermarkId) internal {
+        if (autoUpdateLeaderboard && address(liveLeaderboard) != address(0)) {
+            try liveLeaderboard.updateEvermarkInLeaderboard(cycle, evermarkId) {
+                
+            } catch Error(string memory reason) {
+                emit LeaderboardUpdateFailed(cycle, evermarkId, reason);
+            } catch {
+                emit LeaderboardUpdateFailed(cycle, evermarkId, "Unknown error");
+            }
+        }
+    }
+
+    function updateLeaderboard(uint256 cycle, uint256 evermarkId) external onlyRole(LEADERBOARD_MANAGER_ROLE) {
+        require(address(liveLeaderboard) != address(0), "LiveLeaderboard not set");
+        liveLeaderboard.updateEvermarkInLeaderboard(cycle, evermarkId);
+    }
+
+    function batchUpdateLeaderboard(uint256 cycle, uint256[] calldata evermarkIds) external onlyRole(LEADERBOARD_MANAGER_ROLE) {
+        require(address(liveLeaderboard) != address(0), "LiveLeaderboard not set");
+        liveLeaderboard.batchUpdateLeaderboard(cycle, evermarkIds);
+    }
+
+    function getActiveEvermarksInCycle(uint256 cycle) external view returns (uint256[] memory evermarkIds, uint256[] memory votes) {
+        uint256[] memory activeIds = cycleActiveEvermarks[cycle];
+        uint256[] memory voteAmounts = new uint256[](activeIds.length);
+        
+        for (uint256 i = 0; i < activeIds.length; i++) {
+            voteAmounts[i] = cycleEvermarkVotes[cycle][activeIds[i]];
+        }
+        
+        return (activeIds, voteAmounts);
+    }
+
+    function syncLeaderboardForCycle(uint256 cycle, uint256[] calldata evermarkIds) external onlyRole(LEADERBOARD_MANAGER_ROLE) {
+        require(address(liveLeaderboard) != address(0), "LiveLeaderboard not set");
+        require(votingCycles[cycle].finalized || cycle != currentCycle, "Cannot sync active cycle");
+        
+        uint256 processed = 0;
+        while (processed < evermarkIds.length) {
+            uint256 batchEnd = processed + MAX_BATCH_SIZE;
+            if (batchEnd > evermarkIds.length) {
+                batchEnd = evermarkIds.length;
+            }
+            
+            uint256[] memory batch = new uint256[](batchEnd - processed);
+            for (uint256 i = 0; i < batch.length; i++) {
+                batch[i] = evermarkIds[processed + i];
+            }
+            
+            try liveLeaderboard.batchUpdateLeaderboard(cycle, batch) {
+                
+            } catch Error(string memory reason) {
+                emit BatchLeaderboardUpdateFailed(cycle, batch, reason);
+            } catch {
+                emit BatchLeaderboardUpdateFailed(cycle, batch, "Unknown error");
+            }
+            
+            processed = batchEnd;
+        }
+    }
+
+    function validateLiveLeaderboard() external view returns (bool) {
+        if (address(liveLeaderboard) == address(0)) return false;
+        
+        try liveLeaderboard.getLeaderboardSize(currentCycle) returns (uint256) {
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     function _checkAndStartNewCycle() internal {
@@ -260,7 +380,6 @@ contract EvermarkVoting is
         emit NewVotingCycle(currentCycle, block.timestamp);
     }
 
-    // 🎯 LEADERBOARD SYSTEM - Off-chain computed, on-chain verified
     function submitLeaderboard(
         uint256 cycle,
         uint256[] calldata evermarkIds,
@@ -271,18 +390,15 @@ contract EvermarkVoting is
         require(evermarkIds.length == votes.length, "Array length mismatch");
         require(evermarkIds.length <= 100, "Too many entries");
         
-        // Verify the data is sorted (highest to lowest)
         for (uint256 i = 1; i < votes.length; i++) {
             require(votes[i] <= votes[i-1], "Votes not properly sorted");
         }
         
-        // Verify the vote counts match on-chain data (critical for integrity)
         for (uint256 i = 0; i < evermarkIds.length; i++) {
             uint256 expectedVotes = cycleEvermarkVotes[cycle][evermarkIds[i]];
             require(votes[i] == expectedVotes, "Vote count mismatch");
         }
         
-        // Store the verified leaderboard
         delete cycleLeaderboards[cycle];
         
         for (uint256 i = 0; i < evermarkIds.length; i++) {
@@ -296,7 +412,6 @@ contract EvermarkVoting is
         emit LeaderboardSubmitted(cycle, evermarkIds.length);
     }
 
-    // 🎯 CRITICAL - Function required by EvermarkLeaderboard
     function getTopEvermarksInCycle(uint256 cycle, uint256 limit) external view returns (
         uint256[] memory evermarkIds,
         uint256[] memory votes
@@ -317,7 +432,6 @@ contract EvermarkVoting is
         return (evermarkIds, votes);
     }
 
-    // 📊 VIEW FUNCTIONS - Frontend integration
     function getCurrentCycle() external view returns (uint256) {
         return currentCycle;
     }
@@ -378,7 +492,33 @@ contract EvermarkVoting is
         return cycleLeaderboards[cycle];
     }
 
-    // 🛠️ ADMIN FUNCTIONS
+    function setLiveLeaderboard(address _liveLeaderboard) external onlyRole(ADMIN_ROLE) {
+        if (_liveLeaderboard != address(0)) {
+            try ILiveLeaderboard(_liveLeaderboard).getLeaderboardSize(currentCycle) returns (uint256) {
+                
+            } catch {
+                emit LeaderboardValidationFailed(_liveLeaderboard, "Invalid leaderboard contract");
+                revert("Invalid leaderboard contract");
+            }
+        }
+        
+        liveLeaderboard = ILiveLeaderboard(_liveLeaderboard);
+        emit LiveLeaderboardUpdated(_liveLeaderboard);
+    }
+
+    function setAutoUpdateLeaderboard(bool _enabled) external onlyRole(ADMIN_ROLE) {
+        autoUpdateLeaderboard = _enabled;
+        emit AutoUpdateToggled(_enabled);
+    }
+
+    function getLiveLeaderboardAddress() external view returns (address) {
+        return address(liveLeaderboard);
+    }
+
+    function isAutoUpdateEnabled() external view returns (bool) {
+        return autoUpdateLeaderboard;
+    }
+
     function setEmergencyPause(uint256 pauseUntilTimestamp) external onlyRole(ADMIN_ROLE) {
         emergencyPauseTimestamp = pauseUntilTimestamp;
         emit EmergencyPauseSet(pauseUntilTimestamp);
@@ -423,7 +563,6 @@ contract EvermarkVoting is
         _unpause();
     }
 
-    // Emergency functions
     function emergencyFinalizeCycle(uint256 cycle) external onlyRole(ADMIN_ROLE) {
         VotingCycle storage cycleData = votingCycles[cycle];
         require(!cycleData.finalized, "Cycle already finalized");
